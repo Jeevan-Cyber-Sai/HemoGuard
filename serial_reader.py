@@ -35,7 +35,11 @@ def available_ports():
 
 
 def parse_reading(line):
-    """Turn one raw serial line into a reading dict, or None if unusable."""
+    """Turn one raw serial line into a reading dict, or None if it is not a reading.
+
+    A line qualifies only if it is a JSON object carrying every field in
+    EXPECTED_FIELDS. Everything else is logged and dropped.
+    """
     line = line.strip()
     if not line:
         return None
@@ -50,9 +54,13 @@ def parse_reading(line):
         print(f"[{timestamp()}] SKIP  expected a JSON object: {line!r}")
         return None
 
+    # The firmware shares this wire with command replies and error reports
+    # ({"cmd":...}, {"error":...}). Anything without the full sensor field set
+    # is not a reading, and must never reach sensor_data.json.
     missing = [field for field in EXPECTED_FIELDS if field not in reading]
     if missing:
-        print(f"[{timestamp()}] WARN  missing fields {missing} in: {line!r}")
+        print(f"[{timestamp()}] SKIP  not a reading, missing {missing}: {line!r}")
+        return None
 
     return reading
 

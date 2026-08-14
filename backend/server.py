@@ -30,6 +30,32 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SENSOR_FILE = Path(os.environ.get("HEMOGUARD_SENSOR_FILE", BASE_DIR / "sensor_data.json"))
 LOG_FILE = Path(os.environ.get("HEMOGUARD_LOG_FILE", BASE_DIR / "logs" / "experiment_log.csv"))
 
+# Origins permitted to call the REST endpoints. An origin is an exact
+# scheme+host+port match, so a dashboard served on :8000 needs the port spelled
+# out - "http://localhost" alone only matches port 80. Override the whole list
+# with HEMOGUARD_ALLOWED_ORIGINS as comma-separated values.
+#
+# NOTE: a page opened straight from disk sends "Origin: null" and is no longer
+# allowed here, so GET /latest pre-populate does not work over file://. The
+# dashboard still runs - WebSocket upgrades are not subject to CORS - it just
+# waits for the first broadcast instead of pre-filling.
+WARD_SERVER_ORIGIN = os.environ.get("HEMOGUARD_WARD_ORIGIN", "").strip()
+
+_DEFAULT_ORIGINS = [
+    "http://localhost",
+    "http://localhost:8000",
+    "http://127.0.0.1",
+    "http://127.0.0.1:8000",
+]
+
+_configured = os.environ.get("HEMOGUARD_ALLOWED_ORIGINS", "").strip()
+if _configured:
+    ALLOWED_ORIGINS = [o.strip() for o in _configured.split(",") if o.strip()]
+else:
+    ALLOWED_ORIGINS = list(_DEFAULT_ORIGINS)
+    if WARD_SERVER_ORIGIN:
+        ALLOWED_ORIGINS.append(WARD_SERVER_ORIGIN)
+
 STALE_AFTER_SECONDS = 10
 STALE_CHECK_INTERVAL = 2  # how often the heartbeat re-checks freshness
 ROLLING_WINDOW = 5        # weight readings used for the bleeding-rate slope
@@ -49,9 +75,14 @@ AMBER_THRESHOLD = 1.0
 RED_THRESHOLD = 2.5
 CONSECUTIVE_CRITICAL_REQUIRED = 2  # anti-spike: two cycles at >= 2.5 to escalate
 
+# The colorimeter only sees blood colour usefully under the red illumination
+# LED - the TCS34725's IR-blocking filter makes the IR phase read near-black,
+# and green shifts the ratio wholesale. Only this phase feeds z_hb.
+RED_PHASE_LED = "RED"
+
 CSV_COLUMNS = [
     "timestamp", "weight_g", "spo2", "pulse_bpm", "red", "green", "blue",
-    "clear", "led", "bleeding_rate", "hb_ratio", "z_risk", "triage",
+    "clear", "led", "bleeding_rate", "hb_ratio", "z_risk", "triage", "valid",
 ]
 
 
@@ -65,6 +96,8 @@ class RiskEngine:
     def __init__(self):
         self.weight_window = deque(maxlen=ROLLING_WINDOW)  # (seconds, grams)
         self.consecutive_critical = 0
+        self.red_phase_ratio = None  # last hb ratio measured under the RED LED
+        self.last_scored = None      # carried forward when a reading is invalid
 
     def bleeding_rate(self, weight, moment):
         """mL/min from a least-squares slope over the last ROLLING_WINDOW readings.
@@ -107,19 +140,55 @@ class RiskEngine:
             return 0.0
         return float(red) / total
 
+    @staticmethod
+    def _reading_spo2(reading):
+        """SpO2 as a number, or None when the oximeter had nothing to report.
+
+        The firmware sends 0 for a failed read. Scored literally that is a
+        65-sigma desaturation, so it must be treated as absent, not as 0%.
+        """
+        try:
+            value = float(reading.get("spo2"))
+        except (TypeError, ValueError):
+            return None
+        return None if value <= 0 else value
+
+    def hold(self):
+        """Last computed scores, unchanged - used when a reading is invalid.
+
+        Deliberately touches no engine state: the weight window, the anti-spike
+        counter and the red-phase ratio all stay exactly as the last good
+        reading left them.
+        """
+        if self.last_scored is None:
+            return {"bleeding_rate": 0.0, "hb_ratio": 0.0, "z_rate": 0.0,
+                    "z_hb": 0.0, "z_pr": 0.0, "z_spo2": 0.0, "z_risk": 0.0,
+                    "triage": "green"}
+        return dict(self.last_scored)
+
     def score(self, reading, moment):
         rate = self.bleeding_rate(reading.get("weight", 0), moment)
-        ratio = self.hb_ratio(
-            reading.get("red", 0), reading.get("green", 0),
-            reading.get("blue", 0), reading.get("clear", 0),
-        )
+
+        # Only the red illumination phase produces a meaningful blood-colour
+        # ratio. Other phases hold the last red-phase value rather than
+        # contributing 0, which would make z_risk oscillate every cycle as the
+        # LED rotates and flap the triage band.
+        if str(reading.get("led", "")).upper() == RED_PHASE_LED:
+            self.red_phase_ratio = self.hb_ratio(
+                reading.get("red", 0), reading.get("green", 0),
+                reading.get("blue", 0), reading.get("clear", 0),
+            )
+        ratio = self.red_phase_ratio if self.red_phase_ratio is not None else 0.0
+        scored_hb = self.red_phase_ratio is not None
+
         pulse = float(reading.get("pulse", BASELINE_PULSE[0]))
-        spo2 = float(reading.get("spo2", BASELINE_SPO2[0]))
+        spo2 = self._reading_spo2(reading)
 
         z_rate = max(0.0, (rate - BASELINE_RATE[0]) / BASELINE_RATE[1])
-        z_hb = max(0.0, (ratio - BASELINE_HB[0]) / BASELINE_HB[1])
+        z_hb = max(0.0, (ratio - BASELINE_HB[0]) / BASELINE_HB[1]) if scored_hb else 0.0
         z_pr = max(0.0, (pulse - BASELINE_PULSE[0]) / BASELINE_PULSE[1])
-        z_spo2 = max(0.0, (BASELINE_SPO2[0] - spo2) / BASELINE_SPO2[1])
+        z_spo2 = 0.0 if spo2 is None else max(
+            0.0, (BASELINE_SPO2[0] - spo2) / BASELINE_SPO2[1])
 
         z_risk = (
             WEIGHTS["rate"] * z_rate
@@ -130,7 +199,7 @@ class RiskEngine:
 
         triage = self._triage(z_risk)
 
-        return {
+        self.last_scored = {
             "bleeding_rate": round(rate, 3),
             "hb_ratio": round(ratio, 4),
             "z_rate": round(z_rate, 3),
@@ -140,6 +209,7 @@ class RiskEngine:
             "z_risk": round(z_risk, 3),
             "triage": triage,
         }
+        return dict(self.last_scored)
 
     def _triage(self, z_risk):
         """Anti-spike: a single cycle at >= 2.5 holds at amber; the second escalates."""
@@ -179,6 +249,7 @@ def append_to_csv(payload):
             payload.get("hb_ratio"),
             payload.get("z_risk"),
             payload.get("triage"),
+            payload.get("valid"),
         ])
 
 
@@ -239,8 +310,19 @@ def parse_timestamp(value):
     return None
 
 
+def reading_is_valid(reading):
+    """A reading counts as valid unless the firmware explicitly said otherwise."""
+    flag = reading.get("valid", True)
+    return flag not in (False, 0, "false", "False")
+
+
 def build_payload(reading, moment):
-    scored = engine.score(reading, moment)
+    # An invalid reading means at least one sensor failed. Scoring it would
+    # feed failure sentinels into the engine, so the previous scores and triage
+    # band are carried forward untouched and the frame is flagged instead.
+    valid = reading_is_valid(reading)
+    scored = engine.score(reading, moment) if valid else engine.hold()
+
     payload = {
         "timestamp": reading.get("timestamp") or moment.isoformat(timespec="milliseconds"),
         "weight": reading.get("weight"),
@@ -251,7 +333,8 @@ def build_payload(reading, moment):
         "blue": reading.get("blue"),
         "clear": reading.get("clear"),
         "led": reading.get("led"),
-        "status": "live",
+        "valid": valid,
+        "status": "live" if valid else "sensor_invalid",
     }
     payload.update(scored)
     return payload
@@ -290,8 +373,9 @@ async def process_sensor_file():
 
     append_to_csv(payload)
     await manager.broadcast(payload)
+    flag = "" if payload["valid"] else "  SENSOR_INVALID (scores held)"
     print(f"[{payload['timestamp']}] z_risk={payload['z_risk']} triage={payload['triage']} "
-          f"rate={payload['bleeding_rate']} mL/min hb={payload['hb_ratio']}")
+          f"rate={payload['bleeding_rate']} mL/min hb={payload['hb_ratio']}{flag}")
 
 
 async def broadcast_stale():
@@ -379,6 +463,10 @@ async def lifespan(app):
 
     print(f"Watching {SENSOR_FILE}")
     print(f"Logging to {LOG_FILE}")
+    print(f"CORS allowed origins: {', '.join(ALLOWED_ORIGINS)}")
+    if not WARD_SERVER_ORIGIN and "HEMOGUARD_ALLOWED_ORIGINS" not in os.environ:
+        print("CORS: no ward server origin set (HEMOGUARD_WARD_ORIGIN) - "
+              "localhost only")
 
     if SENSOR_FILE.exists():
         await process_sensor_file()  # pick up whatever is already there
@@ -393,12 +481,9 @@ async def lifespan(app):
 
 app = FastAPI(title="HemoGuard", lifespan=lifespan)
 
-# The dashboard is opened straight from disk during development, which makes its
-# origin "null" - without this, GET /latest is blocked and the page cannot
-# pre-populate before the first WebSocket message.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET"],
     allow_headers=["*"],
 )
