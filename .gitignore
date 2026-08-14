@@ -5,3 +5,5 @@ sensor_data.json
 logs/
 .venv/
 firmware/**/secrets.h
+node_modules/
+dashboard/dist/

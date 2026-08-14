@@ -20,6 +20,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 # --------------------------------------------------------------------------
@@ -33,9 +34,15 @@ LOG_FILE = Path(os.environ.get("HEMOGUARD_LOG_FILE", BASE_DIR / "logs" / "experi
 # without one it defaults to port 80, which is where the ESP32 web server lives.
 ESP32_IP = os.environ.get("HEMOGUARD_ESP32_IP", "").strip()
 SENSOR_URL = f"http://{ESP32_IP}/sensor" if ESP32_IP else ""
+CALIBRATE_URL = f"http://{ESP32_IP}/calibrate" if ESP32_IP else ""
+CAL_STATUS_URL = f"http://{ESP32_IP}/cal_status" if ESP32_IP else ""
 
 POLL_INTERVAL_SECONDS = 1.0
 POLL_TIMEOUT_SECONDS = 2.0   # must stay below the interval budget
+
+# The node blocks for a 10 s sweep before it answers /calibrate, so the ceiling
+# has to clear that with room for the round trip.
+CALIBRATION_TIMEOUT_SECONDS = 15.0
 
 # Origins permitted to call the REST endpoints. An origin is an exact
 # scheme+host+port match, so a dashboard served on :8000 needs the port spelled
@@ -98,13 +105,30 @@ CSV_COLUMNS = [
     "timestamp", "weight_g", "spo2", "pulse_bpm", "red", "green", "blue",
     "clear", "led", "bleeding_rate", "hb_ratio", "z_risk", "triage", "valid",
     "scored_channels",
+    # Beer-Lambert. conc_* are numerically identical to the absorbances by
+    # construction (epsilon = path length = 1.0), so logging them records both.
+    # These are the TRUE signed values: a negative absorbance means the sample
+    # transmitted more light than the water reference, which is evidence of a
+    # stale baseline and must survive into the log even though the dashboard
+    # floors the display at 0.00.
+    "calibrated", "absorbance", "conc_red", "conc_green", "conc_ir",
 ]
 
 # Display-only fields the node may add. They are forwarded to the dashboard
 # untouched and never scored: norm_* are clear-normalised 0-255 values, the
 # wrong units for hb_ratio, which always uses the raw red/green/blue/clear
 # counts so it stays comparable with BASELINE_HB.
-PASSTHROUGH_FIELDS = ("norm_r", "norm_g", "norm_b", "hex")
+#
+# The Beer-Lambert fields ride along here too. They are computed on the node
+# against its own water baseline and are deliberately NOT fed to the risk
+# engine: the weights and thresholds are unchanged, and an unvalidated relative
+# absorbance has no business moving a triage band.
+PASSTHROUGH_FIELDS = (
+    "norm_r", "norm_g", "norm_b", "hex",
+    "calibrated", "absorbance", "concentration",
+    "abs_red", "abs_green", "abs_ir",
+    "conc_red", "conc_green", "conc_ir",
+)
 
 
 # --------------------------------------------------------------------------
@@ -331,6 +355,11 @@ def append_to_csv(payload):
             payload.get("triage"),
             payload.get("valid"),
             "|".join(payload.get("scored_channels") or []),
+            payload.get("calibrated"),
+            payload.get("absorbance"),
+            payload.get("conc_red"),
+            payload.get("conc_green"),
+            payload.get("conc_ir"),
         ])
 
 
@@ -384,6 +413,12 @@ last_reading_time = None   # datetime of the most recent accepted reading
 last_seen_uptime = None    # device uptime_ms of the last reading we processed
 currently_stale = False
 consecutive_invalid = 0    # runs of readings the node flagged valid:false
+
+# The node blocks inside its 10 s calibration sweep and cannot serve /sensor
+# while it runs, so every poll in that window times out. Without this flag the
+# dashboard would flash STALE in the middle of a calibration the operator just
+# started - an alarm state raised by normal operation.
+calibrating = False
 
 # Fields the ESP32 must supply for a response to count as a reading.
 REQUIRED_FIELDS = ("weight", "spo2", "pulse", "red", "green", "blue", "clear", "led")
@@ -521,6 +556,9 @@ async def broadcast_stale():
     if currently_stale:
         return  # already announced; don't spam clients
 
+    if calibrating:
+        return  # the node is busy by request, not unreachable
+
     # A single dropped poll is not staleness. Without this the poller flips the
     # ward badge to STALE on the first timeout, seconds after a perfectly good
     # reading, and any brief Wi-Fi hiccup reads as a dead node.
@@ -560,6 +598,11 @@ async def lifespan(app):
     monitor = asyncio.create_task(staleness_monitor())
 
     print(f"Logging to {LOG_FILE}")
+    if DASHBOARD_DIST.is_dir():
+        print("Dashboard: http://localhost:8000/app/")
+    else:
+        print("Dashboard: dashboard/dist not built - run `npm run build` in "
+              "dashboard/. Serving the legacy page at /frontend/index.html")
     print(f"CORS allowed origins: {', '.join(ALLOWED_ORIGINS)}")
     if not WARD_SERVER_ORIGIN and "HEMOGUARD_ALLOWED_ORIGINS" not in os.environ:
         print("CORS: no ward server origin set (HEMOGUARD_WARD_ORIGIN) - "
@@ -576,7 +619,7 @@ app = FastAPI(title="HemoGuard", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],   # POST /calibrate
     allow_headers=["*"],
 )
 
@@ -589,6 +632,85 @@ async def health():
 @app.get("/latest")
 async def latest():
     return latest_payload
+
+
+@app.get("/cal_status")
+async def cal_status():
+    """Ask the node whether it currently holds a water baseline."""
+    if not CAL_STATUS_URL:
+        return {"calibrated": False, "baseline": None,
+                "error": "HEMOGUARD_ESP32_IP is not set"}
+    try:
+        async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SECONDS) as client:
+            response = await client.get(CAL_STATUS_URL)
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:
+        return {"calibrated": False, "baseline": None,
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.post("/calibrate")
+async def calibrate():
+    """Run the node's water-baseline sweep, narrating it to every dashboard.
+
+    Progress goes out over the WebSocket rather than only to the caller, so a
+    second screen watching the same bed sees the calibration happen instead of
+    silently reading absorbances from a baseline it never saw taken.
+    """
+    global calibrating
+
+    if not CALIBRATE_URL:
+        detail = "HEMOGUARD_ESP32_IP is not set - no sensor node to calibrate."
+        await manager.broadcast({"type": "calibration", "status": "error",
+                                 "message": detail})
+        return {"status": "error", "message": detail}
+
+    if calibrating:
+        return {"status": "error", "message": "Calibration already in progress"}
+
+    calibrating = True
+    await manager.broadcast({
+        "type": "calibration",
+        "status": "started",
+        "message": "Calibrating with water sample - hold still for 10s",
+    })
+    print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+          f"CALIBRATE started")
+
+    try:
+        async with httpx.AsyncClient(timeout=CALIBRATION_TIMEOUT_SECONDS) as client:
+            response = await client.get(CALIBRATE_URL)
+            response.raise_for_status()
+            result = response.json()
+    except Exception as exc:
+        detail = f"Calibration failed - check sensor ({type(exc).__name__})"
+        print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+              f"CALIBRATE FAILED: {type(exc).__name__}: {exc}")
+        await manager.broadcast({"type": "calibration", "status": "error",
+                                 "message": detail})
+        return {"status": "error", "message": detail}
+    finally:
+        # Released before the broadcast so the next poll is free to resume, and
+        # in `finally` so a failed sweep cannot wedge staleness off for good.
+        calibrating = False
+
+    baseline = result.get("baseline")
+    if result.get("status") != "complete" or not baseline:
+        detail = result.get("message") or "Calibration failed - retry"
+        await manager.broadcast({"type": "calibration", "status": "error",
+                                 "message": detail})
+        return {"status": "error", "message": detail}
+
+    print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+          f"CALIBRATE complete: {baseline}")
+    await manager.broadcast({
+        "type": "calibration",
+        "status": "complete",
+        "baseline": baseline,
+        "message": result.get("message") or "Water baseline stored",
+    })
+    return result
 
 
 @app.websocket("/ws")
@@ -614,3 +736,19 @@ async def websocket_endpoint(websocket: WebSocket):
 # anywhere but the repo root would abort at startup with "Directory 'frontend'
 # does not exist".
 app.mount("/frontend", StaticFiles(directory=BASE_DIR / "frontend"), name="frontend")
+
+# The React dashboard, once `npm run build` has produced it. Mounted only when
+# the build exists: StaticFiles raises at import time on a missing directory,
+# which would take the whole API down just because the UI had not been built.
+DASHBOARD_DIST = BASE_DIR / "dashboard" / "dist"
+
+if DASHBOARD_DIST.is_dir():
+    app.mount("/app", StaticFiles(directory=DASHBOARD_DIST, html=True), name="dashboard")
+
+    @app.get("/", include_in_schema=False)
+    async def root():
+        return RedirectResponse("/app/")
+else:
+    @app.get("/", include_in_schema=False)
+    async def root():
+        return RedirectResponse("/frontend/index.html")

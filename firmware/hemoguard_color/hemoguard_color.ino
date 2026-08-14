@@ -1,60 +1,26 @@
-/*
- * HemoGuard colour node - ESP32 + TCS34725 over Wi-Fi
- * ---------------------------------------------------------------------------
- * Serves the current LED-phase snapshot as JSON on GET /sensor, which
- * backend/server.py polls once a second.
- *
- * Wire format (see backend REQUIRED_FIELDS):
- *   red/green/blue/clear   RAW TCS34725 counts - these are what the backend
- *                          scores, and they must stay raw so hb_ratio matches
- *                          BASELINE_HB. Normalised 0-255 values ride along as
- *                          norm_r/norm_g/norm_b purely for display.
- *   weight/spo2/pulse      null - not fitted on this node. The backend reads
- *                          null as "absent" and renormalises the risk weights
- *                          over the channels that are present, so wiring the
- *                          load cell and oximeter in later needs no backend
- *                          change: just emit real numbers here.
- *   valid                  true when the colorimeter answered this phase.
- *                          Absent sensors do NOT make a reading invalid;
- *                          only a sensor that was supposed to answer failing.
- */
-
+#include <math.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include "Adafruit_TCS34725.h"
 #include "secrets.h"
 
-// =====================================================
-// TCS34725 CONNECTION
-// =====================================================
-
 #define TCS_SDA 18
 #define TCS_SCL 19
-
-// =====================================================
-// LED CONNECTIONS
-// =====================================================
-// NOTE: RED and GREEN are the reverse of firmware/hemoguard/hemoguard.ino,
-// which uses RED=25 / GREEN=26. These values match the rig this sketch is
-// actually wired to - do not "align" them without re-wiring the board first.
-// The backend gates the haemoglobin score on led == "RED", so a swap would
-// silently measure blood colour under green illumination.
 
 #define RED_LED   26
 #define GREEN_LED 25
 #define IR_LED    27
 
-// =====================================================
-// TIMING
-// =====================================================
+static const unsigned long LED_DWELL_MS = 2000;
+static const unsigned long WIFI_CHECK_MS = 5000;
 
-static const unsigned long LED_DWELL_MS   = 2000;   // per illumination phase
-static const unsigned long WIFI_CHECK_MS  = 5000;   // reconnect poll interval
+static const float BL_EPSILON = 1.0f;
+static const float BL_PATH_LENGTH = 1.0f;
 
-// =====================================================
-// TCS34725
-// =====================================================
+static const unsigned long CAL_DURATION_MS = 10000;
+static const unsigned long CAL_PHASE_MS = CAL_DURATION_MS / 3;
+static const uint8_t CAL_SAMPLES = 5;
 
 Adafruit_TCS34725 tcs(
   TCS34725_INTEGRATIONTIME_50MS,
@@ -63,17 +29,9 @@ Adafruit_TCS34725 tcs(
 
 bool haveColorimeter = false;
 
-// =====================================================
-// WIFI
-// =====================================================
-
 WebServer server(80);
 
 unsigned long lastWifiCheck = 0;
-
-// =====================================================
-// SENSOR VALUES
-// =====================================================
 
 uint16_t rawR = 0;
 uint16_t rawG = 0;
@@ -86,22 +44,29 @@ int displayB = 0;
 
 String hexColor = "#000000";
 
-// =====================================================
-// LED PHASE
-// =====================================================
-
 static const char *LED_NAMES[3] = { "RED", "GREEN", "IR" };
 
 uint8_t ledPhase = 0;
 
-// =====================================================
-// PHASE SNAPSHOT
-// =====================================================
-// Values measured at the start of the current LED phase.
-// /sensor serves these rather than reading live, so the RGB
-// always matches the led field. Needed because /data calls
-// readColor() on every browser poll, which would otherwise
-// overwrite the phase values mid-phase.
+struct Baseline
+{
+  float R;
+  float G;
+  float B;
+  float C;
+  bool valid;
+};
+
+Baseline baseline[3] = {
+  {0.0f, 0.0f, 0.0f, 0.0f, false},
+  {0.0f, 0.0f, 0.0f, 0.0f, false},
+  {0.0f, 0.0f, 0.0f, 0.0f, false},
+};
+
+bool calibrated = false;
+
+float absPhase[3] = {0.0f, 0.0f, 0.0f};
+float concPhase[3] = {0.0f, 0.0f, 0.0f};
 
 uint16_t snapRawR = 0;
 uint16_t snapRawG = 0;
@@ -120,9 +85,8 @@ bool snapValid = false;
 
 unsigned long snapUptime = 0;
 
-// =====================================================
-// RGB -> HEX
-// =====================================================
+float snapAbs = 0.0f;
+float snapConc = 0.0f;
 
 String rgbToHex(int r, int g, int b)
 {
@@ -139,13 +103,6 @@ String rgbToHex(int r, int g, int b)
   return String(hex);
 }
 
-// =====================================================
-// COLORIMETER PRESENCE
-// =====================================================
-// getRawData() returns void and happily reports zeros on a dead bus, so a
-// yanked cable would otherwise look like a legitimate pitch-black reading.
-// An address probe is the only way to tell the two apart.
-
 bool colorimeterPresent()
 {
   Wire.beginTransmission(TCS34725_ADDRESS);
@@ -153,10 +110,6 @@ bool colorimeterPresent()
   return Wire.endTransmission() == 0;
 }
 
-// A device that is present but was never begun() answers its address while
-// returning whatever the ADC last held - begin() is what writes the
-// integration time, gain and enable bits. So a sensor missing at boot, or
-// unplugged and reconnected, has to be reinitialised and not merely detected.
 bool ensureColorimeter()
 {
   if (!colorimeterPresent())
@@ -178,10 +131,6 @@ bool ensureColorimeter()
 
   return haveColorimeter;
 }
-
-// =====================================================
-// READ COLOR
-// =====================================================
 
 bool readColor()
 {
@@ -234,15 +183,6 @@ bool readColor()
   return true;
 }
 
-// =====================================================
-// SETTLE AND READ
-// =====================================================
-// The TCS34725 integrates over 50 ms, and getRawData() returns
-// whatever the ADC registers already hold. A read taken straight
-// after switching LEDs therefore returns light from the PREVIOUS
-// LED. Discard that conversion and take the next one, which is
-// integrated under the LED now lit.
-
 bool settleAndRead()
 {
   readColor();
@@ -252,9 +192,99 @@ bool settleAndRead()
   return readColor();
 }
 
-// =====================================================
-// CAPTURE PHASE SNAPSHOT
-// =====================================================
+float absorbanceFor(uint8_t phase, float intensity)
+{
+  if (!calibrated) return 0.0f;
+  if (phase > 2) return 0.0f;
+  if (!baseline[phase].valid) return 0.0f;
+
+  float i0 = baseline[phase].C;
+
+  if (!(i0 > 0.0f) || !(intensity > 0.0f)) return 0.0f;
+
+  return log10f(i0 / intensity);
+}
+
+float concentrationFor(float absorbance)
+{
+  float denom = BL_EPSILON * BL_PATH_LENGTH;
+
+  if (!(denom > 0.0f)) return 0.0f;
+
+  return absorbance / denom;
+}
+
+void runCalibration()
+{
+  Serial.println("{\"cmd\":\"calibrate\",\"status\":\"started\"}");
+
+  for (uint8_t phase = 0; phase < 3; phase++)
+  {
+    unsigned long phaseStart = millis();
+
+    applyLed(phase);
+
+    readColor();
+
+    float sumR = 0.0f;
+    float sumG = 0.0f;
+    float sumB = 0.0f;
+    float sumC = 0.0f;
+
+    uint8_t taken = 0;
+
+    for (uint8_t i = 0; i < CAL_SAMPLES; i++)
+    {
+      if (readColor())
+      {
+        sumR += (float)rawR;
+        sumG += (float)rawG;
+        sumB += (float)rawB;
+        sumC += (float)rawC;
+
+        taken++;
+      }
+
+      unsigned long slotEnd =
+        phaseStart + (CAL_PHASE_MS * (unsigned long)(i + 1)) / CAL_SAMPLES;
+
+      while ((long)(millis() - slotEnd) < 0)
+      {
+        delay(5);
+      }
+    }
+
+    if (taken > 0)
+    {
+      baseline[phase].R = sumR / (float)taken;
+      baseline[phase].G = sumG / (float)taken;
+      baseline[phase].B = sumB / (float)taken;
+      baseline[phase].C = sumC / (float)taken;
+
+      baseline[phase].valid = (baseline[phase].C > 0.0f);
+    }
+    else
+    {
+      baseline[phase].valid = false;
+    }
+  }
+
+  calibrated =
+    baseline[0].valid &&
+    baseline[1].valid &&
+    baseline[2].valid;
+
+  for (uint8_t phase = 0; phase < 3; phase++)
+  {
+    absPhase[phase] = 0.0f;
+    concPhase[phase] = 0.0f;
+  }
+
+  snapAbs = 0.0f;
+  snapConc = 0.0f;
+
+  applyLed(ledPhase);
+}
 
 void capturePhaseSnapshot(bool ok)
 {
@@ -267,7 +297,12 @@ void capturePhaseSnapshot(bool ok)
   snapNormG = displayG;
   snapNormB = displayB;
 
-  strncpy(snapHex, hexColor.c_str(), sizeof(snapHex) - 1);
+  strncpy(
+    snapHex,
+    hexColor.c_str(),
+    sizeof(snapHex) - 1
+  );
+
   snapHex[sizeof(snapHex) - 1] = '\0';
 
   snapPhase = ledPhase;
@@ -275,13 +310,21 @@ void capturePhaseSnapshot(bool ok)
   snapValid = ok;
 
   snapUptime = millis();
-}
 
-// =====================================================
-// BUILD SNAPSHOT JSON
-// =====================================================
-// One definition shared by /sensor and the serial line, so the two feeds can
-// never drift apart.
+  if (ok)
+  {
+    float a = absorbanceFor(
+      ledPhase,
+      (float)rawC
+    );
+
+    absPhase[ledPhase] = a;
+    concPhase[ledPhase] = concentrationFor(a);
+  }
+
+  snapAbs = absPhase[ledPhase];
+  snapConc = concPhase[ledPhase];
+}
 
 void buildSnapshotJSON(char *out, size_t len)
 {
@@ -301,7 +344,16 @@ void buildSnapshotJSON(char *out, size_t len)
     ",\"norm_b\":%d"
     ",\"hex\":\"%s\""
     ",\"led\":\"%s\""
-    ",\"valid\":%s}",
+    ",\"valid\":%s"
+    ",\"calibrated\":%s"
+    ",\"absorbance\":%.4f"
+    ",\"concentration\":%.4f"
+    ",\"abs_red\":%.4f"
+    ",\"abs_green\":%.4f"
+    ",\"abs_ir\":%.4f"
+    ",\"conc_red\":%.4f"
+    ",\"conc_green\":%.4f"
+    ",\"conc_ir\":%.4f}",
     snapUptime,
     snapRawR,
     snapRawG,
@@ -312,39 +364,67 @@ void buildSnapshotJSON(char *out, size_t len)
     snapNormB,
     snapHex,
     LED_NAMES[snapPhase],
-    snapValid ? "true" : "false"
+    snapValid ? "true" : "false",
+    calibrated ? "true" : "false",
+    (double)snapAbs,
+    (double)snapConc,
+    (double)absPhase[0],
+    (double)absPhase[1],
+    (double)absPhase[2],
+    (double)concPhase[0],
+    (double)concPhase[1],
+    (double)concPhase[2]
   );
 }
 
-// =====================================================
-// SERIAL JSON OUTPUT
-// =====================================================
-// One line per LED phase. Kept for bench debugging with the board on USB;
-// the backend consumes GET /sensor, not this.
+void buildBaselineJSON(char *out, size_t len)
+{
+  if (!calibrated)
+  {
+    snprintf(out, len, "null");
+    return;
+  }
+
+  snprintf(
+    out,
+    len,
+    "{\"red\":{\"R\":%.1f,\"G\":%.1f,\"B\":%.1f,\"C\":%.1f}"
+    ",\"green\":{\"R\":%.1f,\"G\":%.1f,\"B\":%.1f,\"C\":%.1f}"
+    ",\"ir\":{\"R\":%.1f,\"G\":%.1f,\"B\":%.1f,\"C\":%.1f}}",
+    (double)baseline[0].R,
+    (double)baseline[0].G,
+    (double)baseline[0].B,
+    (double)baseline[0].C,
+    (double)baseline[1].R,
+    (double)baseline[1].G,
+    (double)baseline[1].B,
+    (double)baseline[1].C,
+    (double)baseline[2].R,
+    (double)baseline[2].G,
+    (double)baseline[2].B,
+    (double)baseline[2].C
+  );
+}
 
 void printSerialJSON()
 {
-  char json[320];
+  char json[640];
 
   buildSnapshotJSON(json, sizeof(json));
 
   Serial.println(json);
 }
 
-// =====================================================
-// SENSOR ENDPOINT  ->  GET /sensor
-// =====================================================
-// Serves the phase snapshot to backend/server.py.
-
 void handleSensor()
 {
-  char json[320];
+  char json[640];
 
   buildSnapshotJSON(json, sizeof(json));
 
-  // The dashboard is served from the backend's origin, not the node's, so the
-  // browser treats a direct fetch here as cross-origin.
-  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
 
   server.send(
     200,
@@ -353,9 +433,80 @@ void handleSensor()
   );
 }
 
-// =====================================================
-// ALL LEDS OFF
-// =====================================================
+void handleCalibrate()
+{
+  runCalibration();
+
+  char baselineJson[320];
+
+  buildBaselineJSON(
+    baselineJson,
+    sizeof(baselineJson)
+  );
+
+  char json[480];
+
+  snprintf(
+    json,
+    sizeof(json),
+    "{\"cmd\":\"calibrate\""
+    ",\"status\":\"%s\""
+    ",\"baseline\":%s"
+    ",\"uptime_ms\":%lu"
+    ",\"message\":\"%s\"}",
+    calibrated ? "complete" : "error",
+    baselineJson,
+    millis(),
+    calibrated
+      ? "Water baseline stored"
+      : "Calibration failed - colorimeter did not return usable light"
+  );
+
+  Serial.println(json);
+
+  server.sendHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  server.send(
+    calibrated ? 200 : 503,
+    "application/json",
+    json
+  );
+}
+
+void handleCalStatus()
+{
+  char baselineJson[320];
+
+  buildBaselineJSON(
+    baselineJson,
+    sizeof(baselineJson)
+  );
+
+  char json[420];
+
+  snprintf(
+    json,
+    sizeof(json),
+    "{\"calibrated\":%s,\"baseline\":%s,\"uptime_ms\":%lu}",
+    calibrated ? "true" : "false",
+    baselineJson,
+    millis()
+  );
+
+  server.sendHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
 
 void allLEDsOff()
 {
@@ -364,24 +515,25 @@ void allLEDsOff()
   digitalWrite(IR_LED, LOW);
 }
 
-// =====================================================
-// APPLY LED PHASE
-// =====================================================
-// Exactly one illumination LED on at a time, so the colorimeter only ever
-// sees a single known source.
-
 void applyLed(uint8_t phase)
 {
-  digitalWrite(RED_LED,   phase == 0 ? HIGH : LOW);
-  digitalWrite(GREEN_LED, phase == 1 ? HIGH : LOW);
-  digitalWrite(IR_LED,    phase == 2 ? HIGH : LOW);
+  digitalWrite(
+    RED_LED,
+    phase == 0 ? HIGH : LOW
+  );
+
+  digitalWrite(
+    GREEN_LED,
+    phase == 1 ? HIGH : LOW
+  );
+
+  digitalWrite(
+    IR_LED,
+    phase == 2 ? HIGH : LOW
+  );
 
   ledPhase = phase;
 }
-
-// =====================================================
-// WIFI
-// =====================================================
 
 void connectWifi()
 {
@@ -390,8 +542,6 @@ void connectWifi()
 
   WiFi.mode(WIFI_STA);
 
-  // Modem sleep adds hundreds of ms of latency to inbound requests, which is
-  // most of the backend's 2 s poll timeout.
   WiFi.setSleep(false);
 
   WiFi.begin(
@@ -422,7 +572,6 @@ void connectWifi()
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
 
-    // Copy this line's value into the backend environment variable.
     Serial.println();
     Serial.print("HEMOGUARD_ESP32_IP = ");
     Serial.println(WiFi.localIP());
@@ -433,12 +582,12 @@ void connectWifi()
   }
   else
   {
-    Serial.println("Wi-Fi connection FAILED - will keep retrying.");
+    Serial.println(
+      "Wi-Fi connection FAILED - will keep retrying."
+    );
   }
 }
 
-// A dropped association otherwise leaves the node serving nothing until
-// somebody power-cycles it, which the backend can only report as a timeout.
 void maintainWifi()
 {
   if (WiFi.status() == WL_CONNECTED) return;
@@ -452,12 +601,11 @@ void maintainWifi()
   Serial.println("Wi-Fi lost - reconnecting...");
 
   WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
 }
-
-// =====================================================
-// WEB PAGE
-// =====================================================
 
 void handleRoot()
 {
@@ -465,11 +613,8 @@ void handleRoot()
 
   html += "<!DOCTYPE html>";
   html += "<html>";
-
   html += "<head>";
-
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-
   html += "<title>HemoGuard Color Sensor</title>";
 
   html += "<style>";
@@ -529,23 +674,18 @@ void handleRoot()
   html += "}";
 
   html += "</style>";
-
   html += "</head>";
 
   html += "<body>";
-
   html += "<div class='container'>";
 
   html += "<h1>HemoGuard</h1>";
-
   html += "<h2>TCS34725 Color Sensor</h2>";
 
   html += "<p>Sensor: <span id='status'>...</span></p>";
 
-  // Current LED
   html += "<div id='led'>LED: --</div>";
 
-  // Color display
   html += "<div id='colorBox'></div>";
 
   html += "<div id='hex'>#000000</div>";
@@ -590,10 +730,6 @@ void handleRoot()
 
   html += "</div>";
 
-  // ===================================================
-  // JAVASCRIPT
-  // ===================================================
-
   html += "<script>";
 
   html += "function updateData(){";
@@ -603,6 +739,7 @@ void handleRoot()
   html += ".then(data=>{";
 
   html += "document.getElementById('status').innerText=data.ok?'CONNECTED':'NOT DETECTED';";
+
   html += "document.getElementById('status').style.color=data.ok?'#0a0':'#c00';";
 
   html += "document.getElementById('led').innerText='LED: '+data.led;";
@@ -632,7 +769,6 @@ void handleRoot()
   html += "</script>";
 
   html += "</body>";
-
   html += "</html>";
 
   server.send(
@@ -641,10 +777,6 @@ void handleRoot()
     html
   );
 }
-
-// =====================================================
-// SEND DATA TO PHONE
-// =====================================================
 
 void handleData()
 {
@@ -696,10 +828,6 @@ void handleData()
   );
 }
 
-// =====================================================
-// SETUP
-// =====================================================
-
 void setup()
 {
   Serial.begin(115200);
@@ -711,19 +839,11 @@ void setup()
   Serial.println("HEMOGUARD COLOR SYSTEM");
   Serial.println("================================");
 
-  // ===================================================
-  // LED SETUP
-  // ===================================================
-
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
   pinMode(IR_LED, OUTPUT);
 
   allLEDsOff();
-
-  // ===================================================
-  // I2C
-  // ===================================================
 
   Wire.begin(
     TCS_SDA,
@@ -734,14 +854,6 @@ void setup()
 
   Serial.println("SDA = GPIO 18");
   Serial.println("SCL = GPIO 19");
-
-  // ===================================================
-  // TCS34725
-  // ===================================================
-  // A missing colorimeter is reported and retried in the loop rather than
-  // halting: the node still answers /sensor with valid:false, which the
-  // backend surfaces on the dashboard as a sensor fault. Spinning forever
-  // here would instead look identical to a dead board.
 
   haveColorimeter = tcs.begin();
 
@@ -763,15 +875,7 @@ void setup()
     Serial.println("TCS SCL -> GPIO 19");
   }
 
-  // ===================================================
-  // WIFI
-  // ===================================================
-
   connectWifi();
-
-  // ===================================================
-  // WEB SERVER
-  // ===================================================
 
   server.on(
     "/",
@@ -786,6 +890,16 @@ void setup()
   server.on(
     "/sensor",
     handleSensor
+  );
+
+  server.on(
+    "/calibrate",
+    handleCalibrate
+  );
+
+  server.on(
+    "/cal_status",
+    handleCalStatus
   );
 
   server.begin();
@@ -803,16 +917,6 @@ void setup()
   applyLed(0);
 }
 
-// =====================================================
-// LOOP
-// =====================================================
-// RED -> GREEN -> IR, each for LED_DWELL_MS.
-//
-// Read and snapshot at the START of each phase so /sensor serves values
-// captured while that LED is the one lit. The settle read costs ~100 ms of
-// the dwell; the phase length is unchanged because startTime is taken at
-// the switch.
-
 void loop()
 {
   for (uint8_t phase = 0; phase < 3; phase++)
@@ -821,8 +925,6 @@ void loop()
 
     unsigned long startTime = millis();
 
-    // readColor() reattaches a colorimeter that appears after a bad boot or
-    // drops out mid-run, so neither case needs a reset to recover.
     bool ok = settleAndRead();
 
     capturePhaseSnapshot(ok);

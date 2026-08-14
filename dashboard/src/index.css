@@ -1,0 +1,170 @@
+@import "tailwindcss";
+
+/* --------------------------------------------------------------------------
+   Theme
+   -------------------------------------------------------------------------- */
+@theme {
+  --color-bg: #080c14;
+  --color-card: #0d1220;
+  --color-edge: #1a2035;
+  --color-ink: #e8edf5;
+  --color-muted: #4a5568;
+  --color-safe: #00e676;
+  --color-watch: #ffab00;
+  --color-crit: #ff1744;
+  --color-accent: #2979ff;
+  --color-ir: #7c4dff;
+
+  --font-mono: "Courier New", Courier, monospace;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* --------------------------------------------------------------------------
+   Height-driven type scale
+   --------------------------------------------------------------------------
+   The previous dashboard sized its numerals off viewport WIDTH and pinned the
+   grid to 100vh with overflow hidden. On a 1366x768 laptop that leaves ~640px
+   of usable height: the card rows collapse to ~130px while a 5.6vw numeral
+   still demands ~110px, so the readouts were clipped and the trends crushed.
+
+   Everything below scales off viewport HEIGHT instead, which is the axis that
+   actually runs out. A 768p laptop and a 4K wall display both get a layout
+   proportioned to the space they have. */
+:root {
+  --v-hero: clamp(2rem, 11.5vh, 5.2rem);    /* weight / spo2 / pulse   */
+  --v-mid: clamp(1.6rem, 9vh, 4rem);        /* rate / hb ratio         */
+  --v-gauge: clamp(1.2rem, 4vh, 2.4rem);    /* z-risk numeral          */
+  --v-band: clamp(1.3rem, 4.6vh, 2.8rem);   /* triage word             */
+  --v-chan: clamp(0.85rem, 2.8vh, 1.5rem);  /* optical channel counts  */
+  --v-label: clamp(0.55rem, 1.45vh, 0.75rem);/* small-caps labels      */
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --------------------------------------------------------------------------
+   Animations
+   -------------------------------------------------------------------------- */
+
+/* Header pulse dot */
+@keyframes ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.85;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+.hg-ping {
+  animation: ping 1s ease-out infinite;
+}
+
+/* Value update flash - holds the edge tint ~100ms, then settles back.
+   Deliberately below the threshold of a colour "change": it reads as the card
+   having twitched, not as a state having changed. */
+@keyframes cardflash {
+  0%,
+  28% {
+    background-color: var(--color-edge);
+  }
+  100% {
+    background-color: var(--color-card);
+  }
+}
+.hg-flash {
+  animation: cardflash 350ms ease-out;
+}
+
+/* Critical band breathes until acknowledged. Motion is what carries across a
+   ward, and it is the one thing acknowledgement is allowed to stop. */
+@keyframes breathe {
+  50% {
+    opacity: 0.7;
+  }
+}
+.hg-breathe {
+  animation: breathe 1.5s ease-in-out infinite;
+}
+
+/* Full-screen critical wash */
+@keyframes flashover {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  8% {
+    opacity: 0.3;
+  }
+  22% {
+    opacity: 0;
+  }
+}
+.hg-flashover {
+  animation: flashover 2s infinite;
+}
+
+/* ECG sweep - period is set per-render from the reported pulse rate */
+@keyframes sweep {
+  to {
+    transform: translateX(-400px);
+  }
+}
+.hg-sweep {
+  animation: sweep var(--ecg-period, 3.2s) linear infinite;
+}
+
+/* Toast: slides down from the top edge. The base transform is translateX(-50%)
+   so the keyframes must carry it too, otherwise the toast snaps sideways when
+   the animation hands control back. */
+@keyframes toastin {
+  from {
+    transform: translate(-50%, -18px);
+    opacity: 0;
+  }
+  to {
+    transform: translate(-50%, 0);
+    opacity: 1;
+  }
+}
+.hg-toast {
+  animation: toastin 220ms ease-out;
+}
+
+/* Calibrate button while the sweep runs */
+@keyframes calpulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(41, 121, 255, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(41, 121, 255, 0);
+  }
+}
+.hg-calpulse {
+  animation: calpulse 1.2s ease-out infinite;
+}
+
+/* Degraded feed: the strip freezes rather than implying a live rhythm */
+.hg-degraded .hg-sweep {
+  animation-play-state: paused;
+}
+.hg-degraded .hg-ping {
+  animation: none;
+}
+.hg-degraded .hg-breathe {
+  animation: none;
+}
