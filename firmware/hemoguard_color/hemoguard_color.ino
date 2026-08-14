@@ -341,10 +341,17 @@ void finishCalibration()
 {
   calibrating = false;
 
+  // Only RED and GREEN are required. The haemoglobin index is A_green - A_red,
+  // so IR contributes nothing to it - and the TCS34725 carries an IR-blocking
+  // filter, so this sensor can barely see that band in the first place. It is
+  // still measured and reported for the optical display; it just no longer
+  // holds the whole calibration hostage.
+  //
+  // (IR would matter for turbidity correction, which needs a wavelength the
+  // sample does not absorb. That is a later refinement, not a prerequisite.)
   calibrated =
     baseline[0].valid &&
-    baseline[1].valid &&
-    baseline[2].valid;
+    baseline[1].valid;
 
   for (uint8_t phase = 0; phase < 3; phase++)
   {
@@ -368,9 +375,19 @@ void finishCalibration()
   }
 
   Serial.printf(
-    "{\"cmd\":\"calibrate\",\"status\":\"%s\"}\n",
-    calibrated ? "complete" : "error"
+    "{\"cmd\":\"calibrate\",\"status\":\"%s\""
+    ",\"red\":%s,\"green\":%s,\"ir\":%s}\n",
+    calibrated ? "complete" : "error",
+    baseline[0].valid ? "true" : "false",
+    baseline[1].valid ? "true" : "false",
+    baseline[2].valid ? "true" : "false"
   );
+
+  if (calibrated && !baseline[2].valid)
+  {
+    Serial.println("NOTE: no IR baseline - not required, haemoglobin uses "
+                   "RED and GREEN only.");
+  }
 
   applyLed(ledPhase);
 }
@@ -515,7 +532,10 @@ void buildSnapshotJSON(char *out, size_t len)
     ",\"abs_ir\":%.4f"
     ",\"conc_red\":%.4f"
     ",\"conc_green\":%.4f"
-    ",\"conc_ir\":%.4f}",
+    ",\"conc_ir\":%.4f"
+    ",\"cal_red\":%s"
+    ",\"cal_green\":%s"
+    ",\"cal_ir\":%s}",
     snapUptime,
     snapRawR,
     snapRawG,
@@ -535,7 +555,10 @@ void buildSnapshotJSON(char *out, size_t len)
     (double)absPhase[2],
     (double)concPhase[0],
     (double)concPhase[1],
-    (double)concPhase[2]
+    (double)concPhase[2],
+    baseline[0].valid ? "true" : "false",
+    baseline[1].valid ? "true" : "false",
+    baseline[2].valid ? "true" : "false"
   );
 }
 
@@ -547,30 +570,49 @@ void buildBaselineJSON(char *out, size_t len)
     return;
   }
 
+  // A phase without a valid baseline reports null rather than its zeroed
+  // struct. Emitting {"C":0.0} would read downstream as "measured, and it was
+  // dark" - which is a different statement from "never measured".
+  char red[96];
+  char green[96];
+  char ir[96];
+
+  buildPhaseBaselineJSON(red, sizeof(red), 0);
+  buildPhaseBaselineJSON(green, sizeof(green), 1);
+  buildPhaseBaselineJSON(ir, sizeof(ir), 2);
+
   snprintf(
     out,
     len,
-    "{\"red\":{\"R\":%.1f,\"G\":%.1f,\"B\":%.1f,\"C\":%.1f}"
-    ",\"green\":{\"R\":%.1f,\"G\":%.1f,\"B\":%.1f,\"C\":%.1f}"
-    ",\"ir\":{\"R\":%.1f,\"G\":%.1f,\"B\":%.1f,\"C\":%.1f}}",
-    (double)baseline[0].R,
-    (double)baseline[0].G,
-    (double)baseline[0].B,
-    (double)baseline[0].C,
-    (double)baseline[1].R,
-    (double)baseline[1].G,
-    (double)baseline[1].B,
-    (double)baseline[1].C,
-    (double)baseline[2].R,
-    (double)baseline[2].G,
-    (double)baseline[2].B,
-    (double)baseline[2].C
+    "{\"red\":%s,\"green\":%s,\"ir\":%s}",
+    red,
+    green,
+    ir
+  );
+}
+
+void buildPhaseBaselineJSON(char *out, size_t len, uint8_t phase)
+{
+  if (phase > 2 || !baseline[phase].valid)
+  {
+    snprintf(out, len, "null");
+    return;
+  }
+
+  snprintf(
+    out,
+    len,
+    "{\"R\":%.1f,\"G\":%.1f,\"B\":%.1f,\"C\":%.1f}",
+    (double)baseline[phase].R,
+    (double)baseline[phase].G,
+    (double)baseline[phase].B,
+    (double)baseline[phase].C
   );
 }
 
 void printSerialJSON()
 {
-  char json[640];
+  char json[768];
 
   buildSnapshotJSON(json, sizeof(json));
 
@@ -579,7 +621,7 @@ void printSerialJSON()
 
 void handleSensor()
 {
-  char json[640];
+  char json[768];
 
   buildSnapshotJSON(json, sizeof(json));
 
@@ -649,7 +691,7 @@ void handleCalStatus()
     sizeof(baselineJson)
   );
 
-  char json[420];
+  char json[560];
 
   snprintf(
     json,
@@ -657,11 +699,17 @@ void handleCalStatus()
     "{\"calibrated\":%s"
     ",\"calibrating\":%s"
     ",\"progress\":%.2f"
+    ",\"cal_red\":%s"
+    ",\"cal_green\":%s"
+    ",\"cal_ir\":%s"
     ",\"baseline\":%s"
     ",\"uptime_ms\":%lu}",
     calibrated ? "true" : "false",
     calibrating ? "true" : "false",
     (double)calibrationProgress(),
+    baseline[0].valid ? "true" : "false",
+    baseline[1].valid ? "true" : "false",
+    baseline[2].valid ? "true" : "false",
     baselineJson,
     millis()
   );

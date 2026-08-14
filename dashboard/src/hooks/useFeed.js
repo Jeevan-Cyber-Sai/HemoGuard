@@ -37,7 +37,7 @@ export function useFeed() {
       // Calibration progress shares the socket with sensor frames. It carries
       // no reading, so it must never reach the payload state or the trends -
       // treated as one it would blank every card on screen.
-      if (data.type === "calibration") {
+      if (data.type === "calibration" || data.type === "reference") {
         calSeq.current += 1;
         setCalibration({ ...data, seq: calSeq.current });
         return;

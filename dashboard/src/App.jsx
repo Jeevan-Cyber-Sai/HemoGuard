@@ -38,6 +38,7 @@ export default function App() {
 
   const [toast, setToast] = useState(null);
   const [calibrating, setCalibrating] = useState(false);
+  const [referencing, setReferencing] = useState(false);
   const [countdown, setCountdown] = useState(0);
   const toastTimer = useRef(null);
   const toastSeq = useRef(0);
@@ -56,6 +57,23 @@ export default function App() {
   // makes the broadcast - not the POST - the source of truth here.
   useEffect(() => {
     if (!calibration) return;
+
+    // The concentration reference shares this channel. It has its own wording
+    // and does not drive the 10 s calibration countdown.
+    if (calibration.type === "reference") {
+      if (calibration.status === "started") {
+        setReferencing(true);
+        showToast(calibration.message || "Measuring reference…", "info");
+      } else {
+        setReferencing(false);
+        showToast(
+          calibration.message || "Reference updated",
+          calibration.status === "error" ? "error" : "success",
+        );
+      }
+      return;
+    }
+
     if (calibration.status === "started") {
       setCalibrating(true);
       setCountdown(CAL_SECONDS);
@@ -100,6 +118,44 @@ export default function App() {
       showToast("Calibration failed — retry", "error");
     }
   }, [calibrating, showToast]);
+
+  // One sample of known concentration sets the whole scale: Beer-Lambert is
+  // linear through the origin and the water baseline already fixed the zero,
+  // so no dilution series is needed to start reading real units.
+  const setReference = useCallback(async () => {
+    if (referencing || calibrating) return;
+
+    const entered = window.prompt(
+      "Haemoglobin concentration of the sample now on the sensor (g/dL):\n\n" +
+        "Use a lab-measured value if you have one. For undiluted adult blood " +
+        "≈ 14 is a reasonable assumption; halve it for a 1:1 dilution.",
+      "14",
+    );
+    if (entered === null) return;
+
+    const gdl = Number(entered);
+    if (!Number.isFinite(gdl) || gdl <= 0) {
+      showToast("Enter a number greater than 0", "error");
+      return;
+    }
+
+    setReferencing(true);
+    try {
+      const res = await fetch(`${API_URL}/reference`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ g_dl: gdl }),
+      });
+      const data = await res.json();
+      if (data && data.status === "error") {
+        setReferencing(false);
+        showToast(data.message || "Reference failed", "error");
+      }
+    } catch {
+      setReferencing(false);
+      showToast("Reference failed — backend unreachable", "error");
+    }
+  }, [referencing, calibrating, showToast]);
 
   const p = payload || {};
   const triage = p.triage || null;
@@ -206,6 +262,29 @@ export default function App() {
             }}
           >
             {calibrating ? `CALIBRATING... ${countdown}s` : "CALIBRATE"}
+          </button>
+
+          {/* Only offered once the node has a water baseline - without one the
+              index is a chromaticity and there is nothing to scale. */}
+          <button
+            onClick={setReference}
+            disabled={referencing || calibrating || !p.calibrated}
+            title={p.calibrated
+              ? "Scale to real units using a sample of known concentration"
+              : "Calibrate against water first"}
+            className={
+              "rounded-full border px-3.5 py-1.5 font-mono font-bold tracking-[0.16em] transition-colors " +
+              (referencing ? "hg-calpulse cursor-not-allowed"
+                           : p.calibrated ? "cursor-pointer" : "cursor-not-allowed opacity-40")
+            }
+            style={{
+              fontSize: "clamp(0.55rem, 1.5vh, 0.78rem)",
+              borderColor: "#00e676",
+              color: "#00e676",
+              background: "transparent",
+            }}
+          >
+            {referencing ? "MEASURING..." : "SET REF"}
           </button>
 
           <div
@@ -415,18 +494,54 @@ export default function App() {
                     <span className="text-muted">Absorbance</span>
                     <span className="font-bold">{bl(p.absorbance)}</span>
                   </div>
+                  {/* Real units once a reference of known concentration has
+                      been measured; the relative index until then, labelled so
+                      the two can never be confused. */}
                   <div className="flex justify-between">
                     <span className="text-muted">Concentration</span>
                     <span>
-                      <span className="font-bold">{bl(p.concentration)}</span>
+                      <span className="font-bold">
+                        {p.hb_g_dl != null ? num(p.hb_g_dl, 1) : bl(p.concentration)}
+                      </span>
                       <span
                         className="ml-1.5 text-muted"
                         style={{ fontSize: "calc(var(--v-label) * 0.9)" }}
                       >
-                        rel. units
+                        {p.hb_g_dl != null ? "g/dL" : "rel. units"}
                       </span>
                     </span>
                   </div>
+
+                  {/* An amount needs a volume, so these appear only when
+                      HEMOGUARD_SAMPLE_VOLUME_ML says what is being looked at. */}
+                  {p.blood_ml != null && (
+                    <div className="flex justify-between">
+                      <span className="text-muted">Blood in sample</span>
+                      <span>
+                        <span className="font-bold">{num(p.blood_ml, 2)}</span>
+                        <span
+                          className="ml-1.5 text-muted"
+                          style={{ fontSize: "calc(var(--v-label) * 0.9)" }}
+                        >
+                          mL
+                        </span>
+                      </span>
+                    </div>
+                  )}
+                  {p.hb_mass_mg != null && (
+                    <div className="flex justify-between">
+                      <span className="text-muted">Hb mass</span>
+                      <span>
+                        <span className="font-bold">{num(p.hb_mass_mg, 0)}</span>
+                        <span
+                          className="ml-1.5 text-muted"
+                          style={{ fontSize: "calc(var(--v-label) * 0.9)" }}
+                        >
+                          mg
+                        </span>
+                      </span>
+                    </div>
+                  )}
                 </div>
 
                 <div className="my-[0.5vh] border-t border-edge" />
@@ -437,19 +552,30 @@ export default function App() {
                   className="font-mono tabular-nums"
                   style={{ fontSize: "calc(var(--v-label) * 1.15)" }}
                 >
+                  {/* A phase with no water baseline shows "no baseline", not
+                      A=0.00 - zero absorbance means "matches the reference",
+                      which is a completely different claim from "never
+                      referenced". Only RED and GREEN are required; the index is
+                      A_green - A_red and IR takes no part in it. */}
                   {[
-                    ["RED", p.abs_red, p.conc_red],
-                    ["GREEN", p.abs_green, p.conc_green],
-                    ["IR", p.abs_ir, p.conc_ir],
-                  ].map(([name, a, c]) => (
+                    ["RED", p.abs_red, p.conc_red, p.cal_red],
+                    ["GREEN", p.abs_green, p.conc_green, p.cal_green],
+                    ["IR", p.abs_ir, p.conc_ir, p.cal_ir],
+                  ].map(([name, a, c, hasBase]) => (
                     <div key={name} className="flex items-baseline justify-between">
                       <span style={{ color: LED_TINT[name] }}>{name}</span>
-                      <span className="text-muted">
-                        A=<span className="text-ink">{bl(a)}</span>
-                        <span className="ml-2.5">
-                          C=<span className="text-ink">{bl(c)}</span>
+                      {p.calibrated && hasBase === false ? (
+                        <span className="text-muted">
+                          no baseline{name === "IR" ? " (not required)" : ""}
                         </span>
-                      </span>
+                      ) : (
+                        <span className="text-muted">
+                          A=<span className="text-ink">{bl(a)}</span>
+                          <span className="ml-2.5">
+                            C=<span className="text-ink">{bl(c)}</span>
+                          </span>
+                        </span>
+                      )}
                     </div>
                   ))}
                 </div>

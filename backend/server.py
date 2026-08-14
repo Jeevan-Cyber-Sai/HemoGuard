@@ -11,6 +11,7 @@ Run with:
 
 import asyncio
 import csv
+import json
 import os
 from collections import deque
 from contextlib import asynccontextmanager
@@ -59,6 +60,10 @@ CALIBRATION_MAX_MISSED_POLLS = 6
 # Connection refusals are retried; the node is often just finishing the poll it
 # was already serving when the button was pressed.
 CALIBRATE_ATTEMPTS = 3
+
+# Seconds of live index averaged when setting the concentration reference. One
+# frame carries the full per-frame noise straight into the slope.
+REFERENCE_SAMPLE_SECONDS = 6.0
 
 # Origins permitted to call the REST endpoints. An origin is an exact
 # scheme+host+port match, so a dashboard served on :8000 needs the port spelled
@@ -186,6 +191,29 @@ def _hb_calibration():
 
 HB_CALIBRATION = _hb_calibration()
 
+# Where a reference taken from the dashboard is kept, so the scale survives a
+# restart. A calibration you have to redo every time the server bounces is one
+# that will be wrong half the time.
+CALIBRATION_FILE = Path(os.environ.get(
+    "HEMOGUARD_CALIBRATION_FILE", BASE_DIR / "calibration.json"))
+
+# --------------------------------------------------------------------------
+# Sample geometry - turns concentration into an amount
+# --------------------------------------------------------------------------
+# Concentration answers "how strong", not "how much". To report an amount the
+# volume being looked at has to be known, and only the operator knows it.
+#
+#     set HEMOGUARD_SAMPLE_VOLUME_ML=3.0
+#
+# Left at 0 the amounts are simply not reported, rather than computed from a
+# volume nobody supplied.
+SAMPLE_VOLUME_ML = _threshold("SAMPLE_VOLUME_ML", 0.0)
+
+# Haemoglobin of the undiluted blood the sample was made from. Used only to
+# express the sample as an equivalent volume of whole blood. 14 g/dL is a
+# typical adult figure; set it to the real value if you have one.
+WHOLE_BLOOD_G_DL = _threshold("WHOLE_BLOOD_G_DL", 14.0)
+
 BASELINE_PULSE = _baseline("PULSE", 75.0, 12.0)   # z=2.5 at 105 bpm
 BASELINE_SPO2 = _baseline("SPO2", 98.0, 2.0)      # z=2.5 at 93%
 
@@ -217,7 +245,7 @@ RED_PHASE_LED = "RED"
 
 CSV_COLUMNS = [
     "timestamp", "weight_g", "spo2", "pulse_bpm", "red", "green", "blue",
-    "clear", "led", "bleeding_rate", "hb_index", "hb_mode", "hb_g_dl", "z_hb", "z_risk",
+    "clear", "led", "bleeding_rate", "hb_index", "hb_mode", "hb_g_dl", "blood_ml", "hb_mass_mg", "z_hb", "z_risk",
     "triage", "valid",
     "scored_channels",
     # Beer-Lambert. conc_* are numerically identical to the absorbances by
@@ -241,6 +269,7 @@ CSV_COLUMNS = [
 PASSTHROUGH_FIELDS = (
     "norm_r", "norm_g", "norm_b", "hex",
     "calibrated", "absorbance", "concentration",
+    "cal_red", "cal_green", "cal_ir",
     "abs_red", "abs_green", "abs_ir",
     "conc_red", "conc_green", "conc_ir",
 )
@@ -404,7 +433,7 @@ class RiskEngine:
         """
         if self.last_scored is None:
             return {"bleeding_rate": None, "hb_index": None, "hb_mode": None,
-                    "hb_g_dl": None,
+                    "hb_g_dl": None, "blood_ml": None, "hb_mass_mg": None,
                     "z_rate": 0.0, "z_hb": 0.0, "z_pr": 0.0, "z_spo2": 0.0,
                     "z_risk": None, "triage": "unknown", "scored_channels": []}
         return dict(self.last_scored)
@@ -484,19 +513,43 @@ class RiskEngine:
             triage = "unknown"
             self.consecutive_critical = 0
 
-        # Real units only when the rig has been regressed against known
-        # concentrations. Floored at zero: a negative fitted concentration is
-        # an extrapolation below the calibration range, not a measurement.
+        # Real units only once a reference of known concentration has been
+        # measured. Floored at zero: a negative fitted concentration is an
+        # extrapolation below the calibrated range, not a measurement.
         hb_g_dl = None
-        if scored_hb and HB_CALIBRATION is not None:
-            slope, intercept = HB_CALIBRATION
+        blood_ml = None
+        hb_mass_mg = None
+
+        calibration = active_hb_calibration()
+        if scored_hb and calibration is not None:
+            slope, intercept = calibration
             hb_g_dl = max(0.0, slope * hb_index + intercept)
+
+            # An amount needs a volume, and only the operator knows it.
+            if SAMPLE_VOLUME_ML > 0:
+                # c is g per 100 mL, so mass_g = c * V / 100; reported in mg.
+                hb_mass_mg = hb_g_dl * SAMPLE_VOLUME_ML / 100.0 * 1000.0
+                # How much undiluted blood the sample is equivalent to.
+                #
+                # Capped at the sample volume, because there cannot be more
+                # blood in the cuvette than the cuvette holds. Above the cap the
+                # sample is denser than the WHOLE_BLOOD_G_DL reference, which
+                # means it is not a dilution of that blood at all and the model
+                # no longer applies - reporting 4.3 mL in a 3 mL cuvette would
+                # be arithmetic pretending to be a measurement.
+                if WHOLE_BLOOD_G_DL > 0:
+                    blood_ml = min(
+                        SAMPLE_VOLUME_ML,
+                        (hb_g_dl / WHOLE_BLOOD_G_DL) * SAMPLE_VOLUME_ML,
+                    )
 
         self.last_scored = {
             "bleeding_rate": None if rate is None else round(rate, 3),
             "hb_index": None if hb_index is None else round(hb_index, 4),
             "hb_mode": hb_mode,
             "hb_g_dl": None if hb_g_dl is None else round(hb_g_dl, 2),
+            "blood_ml": None if blood_ml is None else round(blood_ml, 3),
+            "hb_mass_mg": None if hb_mass_mg is None else round(hb_mass_mg, 1),
             "z_rate": round(z_rate, 3),
             "z_hb": round(z_hb, 3),
             "z_pr": round(z_pr, 3),
@@ -568,6 +621,8 @@ def append_to_csv(payload):
             payload.get("hb_index"),
             payload.get("hb_mode"),
             payload.get("hb_g_dl"),
+            payload.get("blood_ml"),
+            payload.get("hb_mass_mg"),
             payload.get("z_hb"),
             payload.get("z_risk"),
             payload.get("triage"),
@@ -826,6 +881,7 @@ async def staleness_monitor():
 @asynccontextmanager
 async def lifespan(app):
     rotate_if_schema_changed()
+    load_saved_calibration()
 
     poller = asyncio.create_task(poll_sensor())
     monitor = asyncio.create_task(staleness_monitor())
@@ -865,6 +921,60 @@ async def health():
 @app.get("/latest")
 async def latest():
     return latest_payload
+
+
+# --------------------------------------------------------------------------
+# Concentration reference
+# --------------------------------------------------------------------------
+# Beer-Lambert is linear THROUGH THE ORIGIN: zero concentration absorbs nothing,
+# and the water calibration has already pinned that end. So one sample of known
+# concentration fixes the whole scale - slope = known_g_dl / measured_index -
+# and a full dilution series is only needed to prove the line is straight, which
+# tools/fit_concentration.py still does.
+
+saved_calibration = None   # {"slope", "reference_g_dl", "reference_index", ...}
+
+
+def load_saved_calibration():
+    global saved_calibration
+    if not CALIBRATION_FILE.exists():
+        return
+    try:
+        with open(CALIBRATION_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        slope = float(data["slope"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        print(f"Calibration file {CALIBRATION_FILE} unreadable ({exc}) - ignoring")
+        return
+    if not slope > 0:
+        print(f"Calibration file has slope {slope}, which cannot be used - ignoring")
+        return
+    saved_calibration = data
+    print(f"Loaded Hb reference: {slope:.4f} g/dL per index unit "
+          f"(from {data.get('reference_g_dl')} g/dL sample)")
+
+
+def store_calibration(data):
+    global saved_calibration
+    saved_calibration = data
+    try:
+        CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CALIBRATION_FILE, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+    except OSError as exc:
+        # The measurement still applies to this session; only persistence failed.
+        print(f"Could not save calibration to {CALIBRATION_FILE}: {exc}")
+
+
+def active_hb_calibration():
+    """(slope, intercept), or None. The environment wins over the saved file so
+    an explicit override is never silently replaced by an old bench reference."""
+    if HB_CALIBRATION is not None:
+        return HB_CALIBRATION
+    if saved_calibration is not None:
+        return (float(saved_calibration["slope"]),
+                float(saved_calibration.get("intercept", 0.0)))
+    return None
 
 
 def describe_node_failure(exc, url):
@@ -908,6 +1018,113 @@ async def cal_status():
     except Exception as exc:
         return {"calibrated": False, "baseline": None,
                 "error": f"{type(exc).__name__}: {exc}"}
+
+
+@app.get("/calibration")
+async def get_calibration():
+    active = active_hb_calibration()
+    return {
+        "calibrated": active is not None,
+        "slope": active[0] if active else None,
+        "intercept": active[1] if active else None,
+        "source": ("environment" if HB_CALIBRATION is not None
+                   else "saved" if saved_calibration else None),
+        "reference": saved_calibration,
+        "sample_volume_ml": SAMPLE_VOLUME_ML or None,
+        "whole_blood_g_dl": WHOLE_BLOOD_G_DL,
+    }
+
+
+@app.post("/reference")
+async def set_reference(body: dict):
+    """Scale the index to real units from one sample of known concentration.
+
+    Averages the live index for a few seconds rather than trusting a single
+    frame, because one reading carries the full per-frame noise straight into
+    the slope and every later concentration inherits it.
+    """
+    try:
+        known_g_dl = float(body.get("g_dl"))
+    except (TypeError, ValueError):
+        return {"status": "error", "message": "Send a numeric g_dl value."}
+
+    if not known_g_dl > 0:
+        return {"status": "error",
+                "message": "Reference concentration must be greater than 0. "
+                           "Water is already the zero point."}
+
+    seconds = float(body.get("seconds") or REFERENCE_SAMPLE_SECONDS)
+    seconds = max(2.0, min(30.0, seconds))
+
+    await manager.broadcast({
+        "type": "reference", "status": "started",
+        "message": f"Measuring reference - hold the {known_g_dl:g} g/dL sample still",
+    })
+
+    samples = []
+    deadline = asyncio.get_running_loop().time() + seconds
+    while asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.4)
+        if latest_payload.get("status") != "live":
+            continue
+        if latest_payload.get("hb_mode") != "absorbance":
+            continue
+        value = latest_payload.get("hb_index")
+        if isinstance(value, (int, float)):
+            samples.append(float(value))
+
+    if len(samples) < 3:
+        detail = ("Not enough live readings. Calibrate the node against water "
+                  "first, and check the feed is LIVE.")
+        await manager.broadcast({"type": "reference", "status": "error",
+                                 "message": detail})
+        return {"status": "error", "message": detail}
+
+    mean_index = sum(samples) / len(samples)
+    if mean_index <= 0:
+        detail = ("The sample absorbed no more than the water baseline, so it "
+                  "cannot set a scale. Re-calibrate against water, then put the "
+                  "sample back without moving the cuvette.")
+        await manager.broadcast({"type": "reference", "status": "error",
+                                 "message": detail})
+        return {"status": "error", "message": detail}
+
+    spread = max(samples) - min(samples)
+    slope = known_g_dl / mean_index
+
+    record = {
+        "slope": round(slope, 6),
+        "intercept": 0.0,          # Beer-Lambert is linear through the origin
+        "reference_g_dl": known_g_dl,
+        "reference_index": round(mean_index, 6),
+        "samples": len(samples),
+        "spread": round(spread, 6),
+        "taken_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    store_calibration(record)
+
+    print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+          f"REFERENCE set: {known_g_dl} g/dL at index {mean_index:.4f} "
+          f"-> {slope:.4f} g/dL per unit (n={len(samples)}, spread={spread:.4f})")
+
+    await manager.broadcast({
+        "type": "reference", "status": "complete", "reference": record,
+        "message": f"Reference set: {known_g_dl:g} g/dL at index {mean_index:.3f}",
+    })
+    return {"status": "complete", "reference": record}
+
+
+@app.delete("/reference")
+async def clear_reference():
+    global saved_calibration
+    saved_calibration = None
+    try:
+        CALIBRATION_FILE.unlink(missing_ok=True)
+    except OSError as exc:
+        print(f"Could not remove {CALIBRATION_FILE}: {exc}")
+    await manager.broadcast({"type": "reference", "status": "cleared",
+                             "message": "Concentration reference cleared"})
+    return {"status": "cleared"}
 
 
 @app.get("/diag")
@@ -1074,9 +1291,10 @@ async def calibrate():
         last_reading_time = datetime.now()
 
     if not baseline:
-        detail = ("Calibration finished without a usable water baseline - at "
-                  "least one LED phase returned no light. Check the sensor is "
-                  "against the sample and the LEDs are lighting.")
+        detail = ("Calibration finished without a usable water baseline - the "
+                  "RED or GREEN phase returned no light. Those two carry the "
+                  "haemoglobin measurement; IR is optional. Check both LEDs "
+                  "light and the sensor is against the sample.")
         await manager.broadcast({"type": "calibration", "status": "error",
                                  "message": detail})
         return {"status": "error", "message": detail}

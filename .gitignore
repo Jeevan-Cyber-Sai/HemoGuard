@@ -7,3 +7,4 @@ logs/
 firmware/**/secrets.h
 node_modules/
 dashboard/dist/
+calibration.json

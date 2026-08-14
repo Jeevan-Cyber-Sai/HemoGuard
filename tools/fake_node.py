@@ -73,6 +73,7 @@ _calibrated = False
 _calibrating = False
 _cal_end = 0.0
 _baseline = None
+NO_IR = False
 
 # Last computed absorbance / concentration per phase, mirroring the firmware's
 # behaviour of holding the other two while one LED is lit.
@@ -84,7 +85,10 @@ def absorbance_for(index, intensity):
     """A = log10(I0 / I), or 0.0 when there is no usable reference."""
     if not _calibrated or _baseline is None:
         return 0.0
-    i0 = _baseline[BASELINE_KEYS[index]]["C"]
+    entry = _baseline.get(BASELINE_KEYS[index])
+    if not entry:
+        return 0.0
+    i0 = entry["C"]
     if i0 <= 0 or intensity <= 0:
         return 0.0
     return math.log10(i0 / intensity)
@@ -138,6 +142,9 @@ class Handler(BaseHTTPRequestHandler):
             "led": led,
             "valid": not FAULT,
             "calibrated": calibrated,
+            "cal_red": bool(_baseline and _baseline.get("red")),
+            "cal_green": bool(_baseline and _baseline.get("green")),
+            "cal_ir": bool(_baseline and _baseline.get("ir")),
             "absorbance": round(abs_now, 4),
             "concentration": round(conc_now, 4),
             "abs_red": round(snapshot_abs[0], 4),
@@ -174,9 +181,14 @@ class Handler(BaseHTTPRequestHandler):
         with _lock:
             if _calibrating and time.time() >= _cal_end:
                 _baseline = {k: dict(v) for k, v in WATER_BASELINE.items()}
+                if NO_IR:
+                    # Dead IR LED: that phase returns no light, so it gets no
+                    # baseline. RED and GREEN still do, and those are the two
+                    # the haemoglobin index is built from.
+                    _baseline["ir"] = None
                 _calibrated = True
                 _calibrating = False
-                print("  baseline stored")
+                print(f"  baseline stored{' (no IR)' if NO_IR else ''}")
 
             progress = 0.0
             if _calibrating:
@@ -198,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global FAULT, HOT, _calibrated, _baseline
+    global FAULT, HOT, NO_IR, _calibrated, _baseline
 
     parser = argparse.ArgumentParser(description="Simulated HemoGuard colour node")
     parser.add_argument("--port", type=int, default=8123)
@@ -208,12 +220,17 @@ def main():
                         help="heavier sample: drives the critical band once calibrated")
     parser.add_argument("--calibrated", action="store_true",
                         help="start with a water baseline already stored")
+    parser.add_argument("--no-ir", action="store_true",
+                        help="simulate a dead IR LED: no IR baseline")
     args = parser.parse_args()
 
     FAULT = args.fault
     HOT = args.hot
+    NO_IR = args.no_ir
     if args.calibrated:
         _baseline = {k: dict(v) for k, v in WATER_BASELINE.items()}
+        if args.no_ir:
+            _baseline["ir"] = None
         _calibrated = True
 
     mode = "  (FAULT mode)" if FAULT else "  (HOT mode)" if HOT else ""
