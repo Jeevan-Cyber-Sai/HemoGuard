@@ -250,8 +250,29 @@ export default function App() {
             <Readout value={num(p.bleeding_rate, 1)} unit="mL/min" size="var(--v-mid)" />
           )}
         </Card>
-        <Card label="Hb Ratio" accent={accent} absent={absent("hb")} flashKey={p.hb_ratio}>
-          {!absent("hb") && <Readout value={num(p.hb_ratio, 2)} size="var(--v-mid)" />}
+        {/* Uncalibrated, the optical channel reports a chromaticity, which is
+            a colour ratio and not a haemoglobin measure - under red light water
+            reads ~0.79 and blood ~0.81. The backend leaves it out of the score
+            and the card says why, rather than showing "NOT FITTED" for a sensor
+            that is plainly present. */}
+        {/* Real units only once the rig has been regressed against samples of
+            known concentration; otherwise the relative index, labelled as such.
+            A g/dL figure that was never measured against anything would be the
+            most convincing wrong number on the screen. */}
+        <Card
+          label={p.hb_g_dl != null ? "Haemoglobin" : "Hb Index"}
+          accent={accent}
+          absent={absent("hb")}
+          absentLabel={p.hb_mode === "chromaticity" ? "NOT CALIBRATED" : "NOT FITTED"}
+          flashKey={p.hb_g_dl != null ? p.hb_g_dl : p.hb_index}
+        >
+          {!absent("hb") && (
+            <Readout
+              value={p.hb_g_dl != null ? num(p.hb_g_dl, 1) : num(p.hb_index, 3)}
+              unit={p.hb_g_dl != null ? "g/dL" : "rel."}
+              size="var(--v-mid)"
+            />
+          )}
         </Card>
         <Card label="Z-Risk" accent={accent} flashKey={p.z_risk}>
           <Gauge z={p.z_risk} />
@@ -474,7 +495,7 @@ export default function App() {
                 className="font-mono tabular-nums text-muted"
                 style={{ fontSize: "var(--v-label)" }}
               >
-                0 – 15
+                0 – {GAUGE_CAP}
               </span>
             </div>
             <Sparkline

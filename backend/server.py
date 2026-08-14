@@ -93,16 +93,114 @@ ROLLING_WINDOW = 5        # weight readings used for the bleeding-rate slope
 # 1 g of blood ~ 1 mL. Kept explicit so it can be tuned to 1.06 g/mL if needed.
 GRAMS_PER_ML = 1.0
 
-# Baselines: (mean, sd)
-BASELINE_RATE = (1.5, 1.0)
-BASELINE_HB = (0.15, 0.08)
-BASELINE_PULSE = (75.0, 12.0)
-BASELINE_SPO2 = (98.0, 1.5)
+# --------------------------------------------------------------------------
+# Scoring baselines and thresholds
+# --------------------------------------------------------------------------
+# Every one of these is overridable from the environment as "mean,sd", e.g.
+#     set HEMOGUARD_BASELINE_HB=0.0,0.35
+# because the optical channel in particular can only be scaled against the rig
+# it is running on. tools/tune_baselines.py derives them from a recorded run.
+
+
+def _baseline(name, mean, sd):
+    raw = os.environ.get(f"HEMOGUARD_BASELINE_{name}", "").strip()
+    if not raw:
+        return (mean, sd)
+    try:
+        parsed_mean, parsed_sd = (float(part) for part in raw.split(","))
+    except ValueError:
+        print(f"BASELINE {name}: cannot parse {raw!r}, expected 'mean,sd' - "
+              f"using default {mean},{sd}")
+        return (mean, sd)
+    if not parsed_sd > 0:
+        # A zero or negative sd makes every z-score infinite or sign-flipped.
+        print(f"BASELINE {name}: sd must be > 0, got {parsed_sd} - "
+              f"using default {mean},{sd}")
+        return (mean, sd)
+    return (parsed_mean, parsed_sd)
+
+
+def _threshold(name, default):
+    raw = os.environ.get(f"HEMOGUARD_{name}", "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"{name}: cannot parse {raw!r} - using default {default}")
+        return default
+
+
+# Bleeding rate, mL/min. Anchored to post-operative drain figures rather than
+# invented: a z of 1.0 lands at ~102 mL/hr, the usual "tell the surgeon" mark,
+# and a z of 2.5 at ~210 mL/hr, which is a surgical emergency.
+#
+# The previous sd of 1.0 mL/min put those thresholds at 150 and 240 mL/hr but
+# with so little headroom that a real bleed produced z_rate ~88, and the rate
+# channel then supplied 98.8% of the total score - the other three sensors were
+# arithmetically incapable of affecting the band.
+BASELINE_RATE = _baseline("RATE", 0.5, 1.2)
+
+# Haemoglobin index - differential absorbance, see RiskEngine.hb_index().
+# Water reads 0.0 by construction, so the mean is 0.0 and the sd sets how much
+# absorbance counts as one sigma. THIS ONE IS RIG-SPECIFIC: it depends on the
+# path length, the cuvette and the LED brightness. Measure your own sample and
+# set it with tools/tune_baselines.py.
+BASELINE_HB = _baseline("HB", 0.0, 0.40)
+
+# --------------------------------------------------------------------------
+# Haemoglobin concentration calibration
+# --------------------------------------------------------------------------
+# hb_g_dl = slope * hb_index + intercept
+#
+# Beer-Lambert gives c = A / (eps * l), but neither term is knowable on this
+# rig: the LED's peak wavelength is unspecified and eps swings by an order of
+# magnitude across the green band, the TCS34725 filters are broad rather than
+# narrow so no single eps applies, and the path length depends on the sample
+# holder. The honest route to real units is the one every colorimeter uses -
+# regress the measured index against samples of KNOWN concentration and keep
+# the fit.
+#
+# Unset means unset. The dashboard then reports the relative index and says so,
+# rather than printing a g/dL figure that was never measured against anything.
+#
+#     set HEMOGUARD_HB_CALIBRATION=16.12,0.05
+#
+# tools/fit_concentration.py produces that line from a dilution series.
+def _hb_calibration():
+    raw = os.environ.get("HEMOGUARD_HB_CALIBRATION", "").strip()
+    if not raw:
+        return None
+    try:
+        slope, intercept = (float(part) for part in raw.split(","))
+    except ValueError:
+        print(f"HB_CALIBRATION: cannot parse {raw!r}, expected "
+              f"'slope,intercept' - reporting relative index instead")
+        return None
+    if slope <= 0:
+        print(f"HB_CALIBRATION: slope must be > 0, got {slope} - "
+              f"reporting relative index instead")
+        return None
+    return (slope, intercept)
+
+
+HB_CALIBRATION = _hb_calibration()
+
+BASELINE_PULSE = _baseline("PULSE", 75.0, 12.0)   # z=2.5 at 105 bpm
+BASELINE_SPO2 = _baseline("SPO2", 98.0, 2.0)      # z=2.5 at 93%
 
 WEIGHTS = {"rate": 0.40, "hb": 0.30, "pr": 0.20, "spo2": 0.10}
 
-AMBER_THRESHOLD = 1.0
-RED_THRESHOLD = 2.5
+# Per-channel z ceiling. Past about 6 sigma the exact figure carries no further
+# decision - it is already maximally abnormal - while an unbounded one lets a
+# single channel swamp the fusion. A nudged drape yields z_rate near 150, at
+# which point the "weighted" score is rate alone and the other three sensors are
+# arithmetically incapable of changing the band. Clamping keeps every channel
+# able to matter, and bounds z_risk to Z_CLAMP so the gauge has a real top end.
+Z_CLAMP = _threshold("Z_CLAMP", 6.0)
+
+AMBER_THRESHOLD = _threshold("AMBER_THRESHOLD", 1.0)
+RED_THRESHOLD = _threshold("RED_THRESHOLD", 2.5)
 CONSECUTIVE_CRITICAL_REQUIRED = 2  # anti-spike: two cycles at >= 2.5 to escalate
 
 # How many consecutive invalid readings may be papered over by replaying the
@@ -119,7 +217,8 @@ RED_PHASE_LED = "RED"
 
 CSV_COLUMNS = [
     "timestamp", "weight_g", "spo2", "pulse_bpm", "red", "green", "blue",
-    "clear", "led", "bleeding_rate", "hb_ratio", "z_risk", "triage", "valid",
+    "clear", "led", "bleeding_rate", "hb_index", "hb_mode", "hb_g_dl", "z_hb", "z_risk",
+    "triage", "valid",
     "scored_channels",
     # Beer-Lambert. conc_* are numerically identical to the absorbances by
     # construction (epsilon = path length = 1.0), so logging them records both.
@@ -157,7 +256,9 @@ class RiskEngine:
     def __init__(self):
         self.weight_window = deque(maxlen=ROLLING_WINDOW)  # (seconds, grams)
         self.consecutive_critical = 0
-        self.red_phase_ratio = None  # last hb ratio measured under the RED LED
+        self.last_hb = None          # (value, mode) of the last usable hb index
+        self.phases_seen = set()     # LEDs actually lit since the last baseline
+        self.calibrated_seen = False # so a new baseline can reset the above
         self.last_scored = None      # carried forward when a reading is invalid
 
     def bleeding_rate(self, weight, moment):
@@ -194,12 +295,80 @@ class RiskEngine:
         ml_per_minute = (grams_per_second * 60.0) / GRAMS_PER_ML
         return max(0.0, ml_per_minute)
 
+    def hb_index(self, reading):
+        """Haemoglobin index from the raw sensor counts. Returns (value, mode).
+
+        Preferred mode, "absorbance" - needs a water baseline:
+
+            A_green = log10(I0_green / I_green)   strong Hb absorption
+            A_red   = log10(I0_red   / I_red)     weak Hb absorption
+            index   = A_green - A_red
+
+        Haemoglobin absorbs around 150x more strongly at 542-577 nm than at
+        660 nm, so the green term carries the signal and the red term carries
+        almost none of it. Both terms contain the SAME wavelength-independent
+        losses - scattering, turbidity, cuvette reflections, LED ageing - so
+        subtracting cancels them and what survives is c*l*(eps_g - eps_r):
+        directly proportional to haemoglobin concentration, which is what
+        Beer-Lambert actually licenses us to claim.
+
+        Fallback mode, "chromaticity" - no baseline yet:
+
+            index = red / (red + green + blue)
+
+        Measured under the RED phase only, and a far weaker signal: it is a
+        colour ratio, not a concentration, and under red illumination the
+        return is red whatever the sample is. It exists so the channel is not
+        simply dead before calibration, not because it is trustworthy.
+
+        The previous formula was red/(red+green+blue+clear), which had two
+        defects at once. It summed C - the unfiltered photodiode that measures
+        TOTAL light - alongside R/G/B as though it were a fourth colour, and it
+        was read under the red LED where blood and a red plastic card differ by
+        about 2%.
+        """
+        calibrated = bool(reading.get("calibrated"))
+        led = str(reading.get("led", "")).upper()
+
+        # The node holds absPhase[] at 0.0 until each LED has been lit once, so
+        # for the first seconds after boot or calibration abs_green is 0 simply
+        # because green has not come round yet. Scored literally that reads as
+        # "no haemoglobin", which is a false negative on a bleeding monitor -
+        # indistinguishable from a clean drape. Wait until both wavelengths the
+        # differential needs have actually been measured.
+        if calibrated and not self.calibrated_seen:
+            self.phases_seen.clear()          # baseline replaced; start again
+        self.calibrated_seen = calibrated
+        if led:
+            self.phases_seen.add(led)
+
+        if calibrated:
+            a_green = self._as_float(reading.get("abs_green"))
+            a_red = self._as_float(reading.get("abs_red"))
+            measured = {"RED", "GREEN"} <= self.phases_seen
+            if a_green is not None and a_red is not None and measured:
+                # Floored at zero: a negative differential means green came back
+                # brighter than the water reference, which is a stale baseline
+                # rather than negative haemoglobin.
+                return max(0.0, a_green - a_red), "absorbance"
+            return None, None
+
+        if led == RED_PHASE_LED:
+            red = self._as_float(reading.get("red")) or 0.0
+            green = self._as_float(reading.get("green")) or 0.0
+            blue = self._as_float(reading.get("blue")) or 0.0
+            total = red + green + blue
+            if total > 0:
+                return red / total, "chromaticity"
+
+        return None, None
+
     @staticmethod
-    def hb_ratio(red, green, blue, clear):
-        total = float(red) + float(green) + float(blue) + float(clear)
-        if total <= 0:
-            return 0.0
-        return float(red) / total
+    def _as_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _optional(reading, field, zero_is_absent=True):
@@ -234,9 +403,10 @@ class RiskEngine:
         reading left them.
         """
         if self.last_scored is None:
-            return {"bleeding_rate": None, "hb_ratio": None, "z_rate": 0.0,
-                    "z_hb": 0.0, "z_pr": 0.0, "z_spo2": 0.0, "z_risk": 0.0,
-                    "triage": "green", "scored_channels": []}
+            return {"bleeding_rate": None, "hb_index": None, "hb_mode": None,
+                    "hb_g_dl": None,
+                    "z_rate": 0.0, "z_hb": 0.0, "z_pr": 0.0, "z_spo2": 0.0,
+                    "z_risk": None, "triage": "unknown", "scored_channels": []}
         return dict(self.last_scored)
 
     def score(self, reading, moment):
@@ -246,28 +416,43 @@ class RiskEngine:
         weight = self._optional(reading, "weight", zero_is_absent=False)
         rate = self.bleeding_rate(weight, moment) if weight is not None else None
 
-        # Only the red illumination phase produces a meaningful blood-colour
-        # ratio. Other phases hold the last red-phase value rather than
-        # contributing 0, which would make z_risk oscillate every cycle as the
-        # LED rotates and flap the triage band.
-        if str(reading.get("led", "")).upper() == RED_PHASE_LED:
-            self.red_phase_ratio = self.hb_ratio(
-                reading.get("red", 0), reading.get("green", 0),
-                reading.get("blue", 0), reading.get("clear", 0),
-            )
-        ratio = self.red_phase_ratio if self.red_phase_ratio is not None else 0.0
-        scored_hb = self.red_phase_ratio is not None
+        # The absorbance form is available on every frame - the node holds all
+        # three phase absorbances and refreshes whichever LED is lit - so the
+        # index no longer waits for the red phase to come round. The last value
+        # is held only for the chromaticity fallback, which genuinely is
+        # red-phase-only; without that hold z_risk would oscillate every cycle
+        # as the LED rotates and flap the triage band.
+        hb_value, hb_mode = self.hb_index(reading)
+        if hb_value is not None:
+            self.last_hb = (hb_value, hb_mode)
+
+        if self.last_hb is None:
+            hb_index, hb_mode = None, None
+        else:
+            hb_index, hb_mode = self.last_hb
+
+        # Only the absorbance form is on a known scale. A chromaticity has no
+        # baseline it can be measured against - under red light water reads
+        # ~0.79 and blood ~0.81 - so scoring it would put a number in the
+        # triage band that carries no information about haemoglobin. It is
+        # reported for display and left out of the score.
+        scored_hb = hb_mode == "absorbance"
 
         pulse = self._optional(reading, "pulse")
         spo2 = self._optional(reading, "spo2")
 
-        z_rate = 0.0 if rate is None else max(
-            0.0, (rate - BASELINE_RATE[0]) / BASELINE_RATE[1])
-        z_hb = max(0.0, (ratio - BASELINE_HB[0]) / BASELINE_HB[1]) if scored_hb else 0.0
-        z_pr = 0.0 if pulse is None else max(
-            0.0, (pulse - BASELINE_PULSE[0]) / BASELINE_PULSE[1])
-        z_spo2 = 0.0 if spo2 is None else max(
-            0.0, (BASELINE_SPO2[0] - spo2) / BASELINE_SPO2[1])
+        def z(value, baseline, invert=False):
+            """One-sided z-score, floored at 0 and capped at Z_CLAMP."""
+            if value is None:
+                return 0.0
+            mean, sd = baseline
+            raw = (mean - value) / sd if invert else (value - mean) / sd
+            return min(Z_CLAMP, max(0.0, raw))
+
+        z_rate = z(rate, BASELINE_RATE)
+        z_hb = z(hb_index, BASELINE_HB) if scored_hb else 0.0
+        z_pr = z(pulse, BASELINE_PULSE)
+        z_spo2 = z(spo2, BASELINE_SPO2, invert=True)
 
         # Score over the channels this node actually reports, renormalised by
         # their share of the weighting. A sensor that is not fitted must not
@@ -290,19 +475,33 @@ class RiskEngine:
         share = sum(WEIGHTS[name] for name in present)
         if share > 0:
             z_risk = sum(WEIGHTS[name] * z for name, z in present.items()) / share
+            triage = self._triage(z_risk)
         else:
-            z_risk = 0.0
+            # Nothing scoreable at all - an uncalibrated colour-only node is
+            # exactly this. z_risk of 0 would paint a reassuring green LOW over
+            # a system that has measured nothing, so the band says so instead.
+            z_risk = None
+            triage = "unknown"
+            self.consecutive_critical = 0
 
-        triage = self._triage(z_risk)
+        # Real units only when the rig has been regressed against known
+        # concentrations. Floored at zero: a negative fitted concentration is
+        # an extrapolation below the calibration range, not a measurement.
+        hb_g_dl = None
+        if scored_hb and HB_CALIBRATION is not None:
+            slope, intercept = HB_CALIBRATION
+            hb_g_dl = max(0.0, slope * hb_index + intercept)
 
         self.last_scored = {
             "bleeding_rate": None if rate is None else round(rate, 3),
-            "hb_ratio": round(ratio, 4) if scored_hb else None,
+            "hb_index": None if hb_index is None else round(hb_index, 4),
+            "hb_mode": hb_mode,
+            "hb_g_dl": None if hb_g_dl is None else round(hb_g_dl, 2),
             "z_rate": round(z_rate, 3),
             "z_hb": round(z_hb, 3),
             "z_pr": round(z_pr, 3),
             "z_spo2": round(z_spo2, 3),
-            "z_risk": round(z_risk, 3),
+            "z_risk": None if z_risk is None else round(z_risk, 3),
             "triage": triage,
             "scored_channels": sorted(present),
         }
@@ -366,7 +565,10 @@ def append_to_csv(payload):
             payload.get("clear"),
             payload.get("led"),
             payload.get("bleeding_rate"),
-            payload.get("hb_ratio"),
+            payload.get("hb_index"),
+            payload.get("hb_mode"),
+            payload.get("hb_g_dl"),
+            payload.get("z_hb"),
             payload.get("z_risk"),
             payload.get("triage"),
             payload.get("valid"),
@@ -523,7 +725,8 @@ async def handle_reading(reading):
     await manager.broadcast(payload)
     flag = "" if payload["valid"] else "  SENSOR_INVALID (scores held)"
     print(f"[{payload['timestamp']}] z_risk={payload['z_risk']} triage={payload['triage']} "
-          f"rate={payload['bleeding_rate']} mL/min hb={payload['hb_ratio']}{flag}")
+          f"rate={payload['bleeding_rate']} mL/min "
+          f"hb={payload['hb_index']} ({payload['hb_mode']}){flag}")
 
 
 async def poll_sensor():

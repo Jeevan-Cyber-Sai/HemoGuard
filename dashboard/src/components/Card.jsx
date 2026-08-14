@@ -5,7 +5,8 @@ import { useEffect, useRef, useState } from "react";
  * does not carry, and `flashKey` ticks the card whenever the value behind it
  * actually changed.
  */
-export function Card({ label, accent, absent, flashKey, className = "", children }) {
+export function Card({ label, accent, absent, absentLabel = "NOT FITTED",
+                       flashKey, className = "", children }) {
   const [flash, setFlash] = useState(0);
   const prev = useRef(flashKey);
 
@@ -49,7 +50,7 @@ export function Card({ label, accent, absent, flashKey, className = "", children
           className="absolute right-3 top-2 font-mono tracking-[0.14em] text-muted"
           style={{ fontSize: "calc(var(--v-label) * 0.92)" }}
         >
-          NOT FITTED
+          {absentLabel}
         </div>
       )}
 

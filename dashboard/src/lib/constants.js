@@ -13,7 +13,11 @@ export const API_URL = DEV ? "" : `http://${HOST}:8000`;
 
 export const RETRY_MS = 3000;
 export const MAX_POINTS = 60;
-export const GAUGE_CAP = 15; // visual clip only; the label shows the true value
+// Matches the backend's per-channel Z_CLAMP: every channel is capped at 6
+// sigma, so the weighted score cannot exceed 6 either. The old cap of 15 was
+// set when z was unbounded, and left the needle in the bottom 40% of the arc
+// for every reading the system can actually produce.
+export const GAUGE_CAP = 6;
 
 export const COLOURS = {
   green: "#00e676",

@@ -29,28 +29,35 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # (led, raw r, g, b, c, normalised r, g, b) - raw counts are what the backend
 # scores; the normalised trio is display-only, exactly as the firmware sends it.
+# A blood sample under each illumination, chosen to behave the way haemoglobin
+# actually does rather than to produce round numbers. Hb absorbs ~150x more
+# strongly at 542-577 nm than at 660 nm, so the GREEN phase returns very little
+# light while RED and IR come back nearly unattenuated. That ordering is the
+# whole signal the optical channel is built on, and a simulator that got it
+# backwards would validate a scoring bug instead of catching one.
+#
+# (led, raw r, g, b, c, normalised r, g, b)
 PHASES = [
-    ("RED",   150,  70, 55, 205, 187, 87, 68),
-    ("GREEN",  60, 104, 88, 418,  36, 63, 53),
-    ("IR",     20,  18, 15, 300,  17, 15, 12),
+    ("RED",   460,  60, 40, 520, 225, 29, 20),
+    ("GREEN",  40,  95, 30, 110,  93, 220, 70),
+    ("IR",     25,  20, 18, 380,  17,  13, 12),
 ]
 
-# --hot: a far redder RED phase. hb_ratio = red/(r+g+b+c) = 250/535 = 0.467,
-# which is (0.467 - 0.15) / 0.08 = 3.96 sigma and escalates to the red band.
-# The normal phases top out at 2.03, so the critical path is otherwise
-# unreachable without hardware.
-HOT_RED = ("RED", 250, 60, 45, 180, 220, 53, 40)
+# --hot: a heavier sample. The green phase drops further still, which is what a
+# rising haemoglobin concentration does to transmitted green light.
+HOT_GREEN = ("GREEN", 30, 45, 22, 45, 170, 255, 125)
 
-# The "water" reference the calibration sweep would measure. Water transmits
-# more than blood, so every CLEAR here sits above the corresponding sample
-# value and the resulting absorbances come out positive:
-#   RED   log10(540/205) = 0.42
-#   GREEN log10(860/418) = 0.31
-#   IR    log10(455/300) = 0.18
+# The "water" reference the calibration sweep would measure. Water absorbs
+# almost nothing across the visible band, so every CLEAR sits above the
+# corresponding sample value:
+#   A_red   = log10(560/520) = 0.032    (blood barely absorbs red)
+#   A_green = log10(880/110) = 0.903    (blood absorbs green hard)
+#   A_ir    = log10(430/380) = 0.054
+#   hb_index = A_green - A_red = 0.871
 WATER_BASELINE = {
-    "red":   {"R": 380.0, "G": 190.0, "B": 150.0, "C": 540.0},
-    "green": {"R": 130.0, "G": 240.0, "B": 195.0, "C": 860.0},
-    "ir":    {"R":  32.0, "G":  28.0, "B":  24.0, "C": 455.0},
+    "red":   {"R": 500.0, "G": 210.0, "B": 165.0, "C": 560.0},
+    "green": {"R": 150.0, "G": 430.0, "B": 205.0, "C": 880.0},
+    "ir":    {"R":  30.0, "G":  26.0, "B":  22.0, "C": 430.0},
 }
 
 BASELINE_KEYS = ["red", "green", "ir"]
@@ -109,7 +116,8 @@ class Handler(BaseHTTPRequestHandler):
         elapsed = time.time() - START
         phase = int(elapsed // 2)
         idx = phase % 3
-        led, r, g, b, c, nr, ng, nb = HOT_RED if (HOT and idx == 0) else PHASES[idx]
+        led, r, g, b, c, nr, ng, nb = (
+            HOT_GREEN if (HOT and idx == 1) else PHASES[idx])
 
         with _lock:
             a = absorbance_for(idx, float(c))
@@ -197,7 +205,7 @@ def main():
     parser.add_argument("--fault", action="store_true",
                         help="report valid:false to test the sensor-fault path")
     parser.add_argument("--hot", action="store_true",
-                        help="emit a bleeding-red colour to drive the critical band")
+                        help="heavier sample: drives the critical band once calibrated")
     parser.add_argument("--calibrated", action="store_true",
                         help="start with a water baseline already stored")
     args = parser.parse_args()

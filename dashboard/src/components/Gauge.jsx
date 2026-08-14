@@ -88,8 +88,8 @@ export function Gauge({ z }) {
         <text x="14" y="112" fill="#4a5568" fontSize="11" fontFamily="Courier New, monospace">
           0
         </text>
-        <text x="170" y="112" fill="#4a5568" fontSize="11" fontFamily="Courier New, monospace">
-          15+
+        <text x="174" y="112" fill="#4a5568" fontSize="11" fontFamily="Courier New, monospace">
+          {GAUGE_CAP}+
         </text>
       </svg>
     </div>

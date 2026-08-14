@@ -12,7 +12,7 @@
 #define GREEN_LED 25
 #define IR_LED    27
 
-static const unsigned long LED_DWELL_MS = 2000;
+static const unsigned long LED_DWELL_MS = 1000;   // averaged across, not idled
 static const unsigned long WIFI_CHECK_MS = 5000;
 
 static const float BL_EPSILON = 1.0f;
@@ -20,7 +20,7 @@ static const float BL_PATH_LENGTH = 1.0f;
 
 static const unsigned long CAL_DURATION_MS = 10000;
 static const unsigned long CAL_PHASE_MS = CAL_DURATION_MS / 3;
-static const uint8_t CAL_SAMPLES = 5;
+static const uint8_t CAL_SAMPLES = 15;
 
 Adafruit_TCS34725 tcs(
   TCS34725_INTEGRATIONTIME_50MS,
@@ -28,6 +28,12 @@ Adafruit_TCS34725 tcs(
 );
 
 bool haveColorimeter = false;
+
+// Re-initialisation backoff for a colorimeter believed absent. Long enough that
+// a genuinely missing sensor cannot stall the phase cycle with begin() calls.
+static const unsigned long COLOR_RETRY_MS = 2000;
+
+unsigned long lastColorRetryMs = 0;
 
 WebServer server(80);
 
@@ -52,8 +58,22 @@ uint8_t ledPhase = 0;
 // initialises them: the IDE generates function prototypes automatically, but
 // never variable declarations, so anything used before its definition has to
 // live up here.
+//
+// Readings are accumulated across the whole dwell and averaged at the end of
+// it. Previously one conversion was taken at the top of each phase and the
+// remaining ~95% of the dwell was spent idle, which threw away the only thing
+// that time was good for. Absorbance is a logarithm of a ratio, so noise in the
+// raw counts is amplified worst exactly where the green reading sits when blood
+// is in the cuvette - averaging is worth more here than anywhere else.
 unsigned long phaseStartMs = 0;
-bool phaseCaptured = false;
+bool phaseSettled = false;
+
+uint32_t phaseSumR = 0;
+uint32_t phaseSumG = 0;
+uint32_t phaseSumB = 0;
+uint32_t phaseSumC = 0;
+
+uint16_t phaseSamples = 0;
 
 struct Baseline
 {
@@ -110,51 +130,56 @@ String rgbToHex(int r, int g, int b)
   return String(hex);
 }
 
-bool colorimeterPresent()
+void blankColor()
 {
-  Wire.beginTransmission(TCS34725_ADDRESS);
+  rawR = 0;
+  rawG = 0;
+  rawB = 0;
+  rawC = 0;
 
-  return Wire.endTransmission() == 0;
+  displayR = 0;
+  displayG = 0;
+  displayB = 0;
+
+  hexColor = "#000000";
 }
 
-bool ensureColorimeter()
-{
-  if (!colorimeterPresent())
-  {
-    haveColorimeter = false;
-
-    return false;
-  }
-
-  if (!haveColorimeter)
-  {
-    haveColorimeter = tcs.begin();
-
-    if (haveColorimeter)
-    {
-      Serial.println("TCS34725 reattached - reinitialised.");
-    }
-  }
-
-  return haveColorimeter;
-}
-
+// Recovery for a sensor that was missing at boot or came loose mid-run.
+//
+// There is deliberately NO per-read bus probe here. Probing with a zero-length
+// I2C write - beginTransmission() straight into endTransmission() - is not
+// reliably supported on the ESP32 and can report a NACK for a device that is
+// present and answering. Wired into the read path it declared the colorimeter
+// absent on every call, which blanked every channel and left calibration with
+// nothing to average. The sensor works; the probe was wrong.
+//
+// So: trust begin(), and only retry it when we already believe the sensor is
+// gone, at a rate that cannot stall the phase cycle.
 bool readColor()
 {
-  if (!ensureColorimeter())
+  if (!haveColorimeter)
   {
-    rawR = 0;
-    rawG = 0;
-    rawB = 0;
-    rawC = 0;
+    unsigned long now = millis();
 
-    displayR = 0;
-    displayG = 0;
-    displayB = 0;
+    if (now - lastColorRetryMs < COLOR_RETRY_MS)
+    {
+      blankColor();
 
-    hexColor = "#000000";
+      return false;
+    }
 
-    return false;
+    lastColorRetryMs = now;
+
+    haveColorimeter = tcs.begin();
+
+    if (!haveColorimeter)
+    {
+      blankColor();
+
+      return false;
+    }
+
+    Serial.println("TCS34725 reinitialised.");
   }
 
   tcs.getRawData(
@@ -164,11 +189,20 @@ bool readColor()
     &rawC
   );
 
+  deriveDisplayFromRaw();
+
+  return true;
+}
+
+// Display values follow from whatever is in rawR/G/B/C, so this is called both
+// after a live read and after the phase average is written back into them.
+void deriveDisplayFromRaw()
+{
   if (rawC > 0)
   {
-    float r = ((float)rawR / rawC) * 255.0;
-    float g = ((float)rawG / rawC) * 255.0;
-    float b = ((float)rawB / rawC) * 255.0;
+    float r = ((float)rawR / rawC) * 255.0f;
+    float g = ((float)rawG / rawC) * 255.0f;
+    float b = ((float)rawB / rawC) * 255.0f;
 
     displayR = constrain((int)r, 0, 255);
     displayG = constrain((int)g, 0, 255);
@@ -186,17 +220,6 @@ bool readColor()
     displayG,
     displayB
   );
-
-  return true;
-}
-
-bool settleAndRead()
-{
-  readColor();
-
-  server.handleClient();
-
-  return readColor();
 }
 
 float absorbanceFor(uint8_t phase, float intensity)
@@ -1064,7 +1087,8 @@ void setup()
   applyLed(0);
 
   phaseStartMs = millis();
-  phaseCaptured = false;
+
+  resetPhaseAccumulators();
 }
 
 // =====================================================
@@ -1074,35 +1098,85 @@ void setup()
 // the CPU for a full 6 s rotation, which meant a calibration request could only
 // be noticed at a dwell boundary and nothing else could interleave with it.
 
+void resetPhaseAccumulators()
+{
+  phaseSumR = 0;
+  phaseSumG = 0;
+  phaseSumB = 0;
+  phaseSumC = 0;
+
+  phaseSamples = 0;
+  phaseSettled = false;
+}
+
 void normalStep()
 {
   unsigned long now = millis();
 
-  if (!phaseCaptured)
+  // 1. Settle. The first conversion after an LED switch integrated under the
+  //    PREVIOUS LED, so it is read and thrown away.
+  if (!phaseSettled)
   {
-    bool ok = settleAndRead();
+    readColor();
 
-    // A colorimeter that appears after a bad boot, or drops out mid-run, is
-    // picked up here rather than needing a reset.
-    haveColorimeter = ok;
-
-    capturePhaseSnapshot(ok);
-
-    printSerialJSON();
-
-    phaseCaptured = true;
+    phaseSettled = true;
 
     return;
   }
 
-  if (now - phaseStartMs < LED_DWELL_MS) return;
+  // 2. Accumulate for the rest of the dwell. At 50 ms integration a 1 s phase
+  //    yields ~17 conversions, cutting random noise by about 4x.
+  if (now - phaseStartMs < LED_DWELL_MS)
+  {
+    if (readColor())
+    {
+      phaseSumR += rawR;
+      phaseSumG += rawG;
+      phaseSumB += rawB;
+      phaseSumC += rawC;
+
+      phaseSamples++;
+    }
+
+    return;
+  }
+
+  // 3. Dwell over: average back into the raw registers, publish, advance.
+  bool ok = (phaseSamples > 0);
+
+  if (ok)
+  {
+    // Rounded rather than truncated - at these counts a consistent downward
+    // bias would show up as a small fixed absorbance offset.
+    rawR = (uint16_t)((phaseSumR + phaseSamples / 2) / phaseSamples);
+    rawG = (uint16_t)((phaseSumG + phaseSamples / 2) / phaseSamples);
+    rawB = (uint16_t)((phaseSumB + phaseSamples / 2) / phaseSamples);
+    rawC = (uint16_t)((phaseSumC + phaseSamples / 2) / phaseSamples);
+
+    deriveDisplayFromRaw();
+  }
+  else
+  {
+    blankColor();
+  }
+
+  // A colorimeter that appears after a bad boot, or drops out mid-run, is
+  // picked up here rather than needing a reset.
+  haveColorimeter = ok;
+
+  // Snapshot before advancing: capturePhaseSnapshot() indexes absPhase[] by
+  // ledPhase, and these averages belong to the phase that is ending.
+  capturePhaseSnapshot(ok);
+
+  printSerialJSON();
 
   ledPhase = (ledPhase + 1) % 3;
 
   applyLed(ledPhase);
 
   phaseStartMs = now;
-  phaseCaptured = false;
+
+  resetPhaseAccumulators();
 }
 
 // =====================================================
