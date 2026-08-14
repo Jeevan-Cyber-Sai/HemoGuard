@@ -44,6 +44,22 @@ POLL_TIMEOUT_SECONDS = 2.0   # must stay below the interval budget
 # has to clear that with room for the round trip.
 CALIBRATION_TIMEOUT_SECONDS = 15.0
 
+# The node now acknowledges /calibrate immediately and runs the sweep in its own
+# loop, so this request is short. Progress is followed on /cal_status.
+CALIBRATION_ACK_TIMEOUT_SECONDS = 5.0
+
+# How long to follow the sweep before giving up. Generously above the node's
+# 10 s so a slow phase is never mistaken for a dead board.
+CALIBRATION_WATCH_SECONDS = 30.0
+
+# Consecutive unanswered status polls before declaring the node gone. A busy
+# node drops the odd one; only sustained silence means it actually reset.
+CALIBRATION_MAX_MISSED_POLLS = 6
+
+# Connection refusals are retried; the node is often just finishing the poll it
+# was already serving when the button was pressed.
+CALIBRATE_ATTEMPTS = 3
+
 # Origins permitted to call the REST endpoints. An origin is an exact
 # scheme+host+port match, so a dashboard served on :8000 needs the port spelled
 # out - "http://localhost" alone only matches port 80. Override the whole list
@@ -520,9 +536,23 @@ async def poll_sensor():
     print(f"Polling {SENSOR_URL} every {POLL_INTERVAL_SECONDS:g}s")
     announced_failure = False
 
-    async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SECONDS) as client:
+    # No keep-alive. The ESP32's WebServer handles a single connection at a
+    # time, so a pooled socket held open between polls occupies the node's only
+    # slot and every other request - /calibrate above all - is refused outright
+    # rather than queued. Closing after each poll leaves the slot free.
+    limits = httpx.Limits(max_keepalive_connections=0)
+
+    async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SECONDS, limits=limits,
+                                 headers={"Connection": "close"}) as client:
         while True:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+            # Stand off entirely while the node is calibrating: it cannot answer
+            # /sensor during the sweep, and competing for its one socket is what
+            # makes the calibration itself fail to connect.
+            if calibrating:
+                continue
+
             try:
                 response = await client.get(SENSOR_URL)
                 response.raise_for_status()
@@ -634,6 +664,33 @@ async def latest():
     return latest_payload
 
 
+def describe_node_failure(exc, url):
+    """Turn a transport exception into the thing the operator should go and do.
+
+    The old wording blamed the sensor for every failure, which sent people to
+    check wiring when the actual fault was that nothing on the network answered
+    at that address. The distinction is in the exception type and it is worth
+    surfacing: a refused connection and a silent one have completely different
+    fixes.
+    """
+    if isinstance(exc, httpx.ConnectError):
+        return (f"Cannot reach the sensor node at {url} - nothing answered. "
+                f"Check the IP printed on the ESP32's serial monitor, and that "
+                f"the board and this PC are on the same Wi-Fi.")
+    if isinstance(exc, (httpx.ReadTimeout, httpx.ConnectTimeout,
+                        httpx.PoolTimeout)):
+        return (f"The node accepted the connection but did not finish "
+                f"calibrating within {CALIBRATION_TIMEOUT_SECONDS:g}s. "
+                f"Check the serial monitor for a reset.")
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code == 404:
+            return ("The node has no /calibrate endpoint - it is running older "
+                    "firmware. Re-flash firmware/hemoguard_color.")
+        return f"The node rejected the calibration request (HTTP {code})."
+    return f"Calibration failed: {type(exc).__name__}: {exc}"
+
+
 @app.get("/cal_status")
 async def cal_status():
     """Ask the node whether it currently holds a water baseline."""
@@ -650,6 +707,56 @@ async def cal_status():
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
+@app.get("/diag")
+async def diag():
+    """One call that says which link in the chain is broken.
+
+    Reachability, the calibrate route and the baseline are three separate
+    failures with three different fixes, and guessing between them from a single
+    error string wastes far more time than asking the node directly.
+    """
+    report = {
+        "esp32_ip": ESP32_IP or None,
+        "sensor_url": SENSOR_URL or None,
+        "last_reading": last_reading_time.isoformat() if last_reading_time else None,
+        "checks": [],
+    }
+
+    if not ESP32_IP:
+        report["verdict"] = ("HEMOGUARD_ESP32_IP is not set in the window "
+                             "running uvicorn. Set it and restart.")
+        return report
+
+    limits = httpx.Limits(max_keepalive_connections=0)
+    async with httpx.AsyncClient(timeout=3.0, limits=limits,
+                                 headers={"Connection": "close"}) as client:
+        for name, url in (("sensor", SENSOR_URL), ("cal_status", CAL_STATUS_URL)):
+            try:
+                response = await client.get(url)
+                report["checks"].append({
+                    "endpoint": name, "url": url, "ok": response.is_success,
+                    "http_status": response.status_code,
+                })
+            except Exception as exc:
+                report["checks"].append({
+                    "endpoint": name, "url": url, "ok": False,
+                    "error": type(exc).__name__, "detail": str(exc),
+                })
+
+    reachable = [c for c in report["checks"] if c.get("ok")]
+    if not reachable:
+        report["verdict"] = (
+            "The node is not reachable from this PC at all. Either the IP is "
+            "stale (check the ESP32 serial monitor) or the network blocks "
+            "device-to-device traffic - try a 2.4GHz phone hotspot.")
+    elif len(reachable) < len(report["checks"]):
+        report["verdict"] = ("The node answers but not on every endpoint - it is "
+                             "likely running older firmware. Re-flash.")
+    else:
+        report["verdict"] = "Node reachable on all endpoints. Calibration should work."
+    return report
+
+
 @app.post("/calibrate")
 async def calibrate():
     """Run the node's water-baseline sweep, narrating it to every dashboard.
@@ -658,7 +765,7 @@ async def calibrate():
     second screen watching the same bed sees the calibration happen instead of
     silently reading absorbances from a baseline it never saw taken.
     """
-    global calibrating
+    global calibrating, last_reading_time
 
     if not CALIBRATE_URL:
         detail = "HEMOGUARD_ESP32_IP is not set - no sensor node to calibrate."
@@ -678,29 +785,101 @@ async def calibrate():
     print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
           f"CALIBRATE started")
 
+    # Let the in-flight poll finish and its socket close, so the node has a free
+    # connection slot before we ask for one.
+    await asyncio.sleep(POLL_TIMEOUT_SECONDS + 0.3)
+
+    # The node acknowledges immediately and runs the sweep in its own loop, so
+    # this is a short request followed by polling - never one long request that
+    # a single timeout can lose. A slow phase and a board that reset are now
+    # distinguishable: the first keeps reporting progress, the second stops
+    # answering.
+    limits = httpx.Limits(max_keepalive_connections=0)
+    last_error = None
+    baseline = None
+
     try:
-        async with httpx.AsyncClient(timeout=CALIBRATION_TIMEOUT_SECONDS) as client:
-            response = await client.get(CALIBRATE_URL)
-            response.raise_for_status()
-            result = response.json()
-    except Exception as exc:
-        detail = f"Calibration failed - check sensor ({type(exc).__name__})"
-        print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
-              f"CALIBRATE FAILED: {type(exc).__name__}: {exc}")
-        await manager.broadcast({"type": "calibration", "status": "error",
-                                 "message": detail})
-        return {"status": "error", "message": detail}
+        async with httpx.AsyncClient(timeout=CALIBRATION_ACK_TIMEOUT_SECONDS,
+                                     limits=limits,
+                                     headers={"Connection": "close"}) as client:
+            ack = None
+            for attempt in range(1, CALIBRATE_ATTEMPTS + 1):
+                try:
+                    response = await client.get(CALIBRATE_URL)
+                    response.raise_for_status()
+                    ack = response.json()
+                    break
+                except httpx.ConnectError as exc:
+                    # Nothing accepted the connection - worth retrying, the node
+                    # may still have been finishing the poll it was serving.
+                    last_error = exc
+                    print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+                          f"CALIBRATE connect attempt {attempt}/{CALIBRATE_ATTEMPTS} "
+                          f"failed: {exc}")
+                    if attempt < CALIBRATE_ATTEMPTS:
+                        await asyncio.sleep(1.5)
+                except Exception as exc:
+                    last_error = exc
+                    break
+
+            if ack is None:
+                detail = describe_node_failure(last_error, CALIBRATE_URL)
+                print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+                      f"CALIBRATE FAILED: {type(last_error).__name__}: {last_error}")
+                await manager.broadcast({"type": "calibration", "status": "error",
+                                         "message": detail})
+                return {"status": "error", "message": detail}
+
+            # Follow the sweep to completion.
+            deadline = asyncio.get_running_loop().time() + CALIBRATION_WATCH_SECONDS
+            missed = 0
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(1.0)
+                try:
+                    status = (await client.get(CAL_STATUS_URL)).json()
+                    missed = 0
+                except Exception as exc:
+                    # A few dropped status polls are normal on a busy node; only
+                    # a sustained silence means it has actually gone away.
+                    last_error = exc
+                    missed += 1
+                    if missed >= CALIBRATION_MAX_MISSED_POLLS:
+                        detail = ("Lost contact with the node during calibration "
+                                  "- check the serial monitor for a reset.")
+                        await manager.broadcast({"type": "calibration",
+                                                 "status": "error",
+                                                 "message": detail})
+                        return {"status": "error", "message": detail}
+                    continue
+
+                if status.get("calibrating"):
+                    continue
+
+                if status.get("calibrated") and status.get("baseline"):
+                    baseline = status["baseline"]
+                break
     finally:
         # Released before the broadcast so the next poll is free to resume, and
         # in `finally` so a failed sweep cannot wedge staleness off for good.
+        #
+        # The staleness clock is restarted at the same moment. It kept running
+        # while the poller stood off, so without this the monitor sees a reading
+        # ~13 s old the instant the flag drops and flashes STALE for the second
+        # before the next poll lands. Answering /cal_status is itself proof the
+        # node was alive just now, so the reset states a fact.
         calibrating = False
+        last_reading_time = datetime.now()
 
-    baseline = result.get("baseline")
-    if result.get("status") != "complete" or not baseline:
-        detail = result.get("message") or "Calibration failed - retry"
+    if not baseline:
+        detail = ("Calibration finished without a usable water baseline - at "
+                  "least one LED phase returned no light. Check the sensor is "
+                  "against the sample and the LEDs are lighting.")
         await manager.broadcast({"type": "calibration", "status": "error",
                                  "message": detail})
         return {"status": "error", "message": detail}
+
+    result = {"cmd": "calibrate", "status": "complete", "baseline": baseline,
+              "message": "Water baseline stored"}
 
     print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
           f"CALIBRATE complete: {baseline}")

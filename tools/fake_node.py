@@ -63,6 +63,8 @@ HOT = False
 
 _lock = threading.Lock()
 _calibrated = False
+_calibrating = False
+_cal_end = 0.0
 _baseline = None
 
 # Last computed absorbance / concentration per phase, mirroring the firmware's
@@ -139,29 +141,46 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _calibrate(self):
-        """Blocks for the full sweep before replying, exactly as the node does."""
-        global _calibrated, _baseline
-
-        print(f"  calibrating for {CAL_DURATION_S:g}s...")
-        time.sleep(CAL_DURATION_S)
+        """Acknowledges immediately; the sweep runs on a timer, as the node does."""
+        global _calibrating, _cal_end
 
         with _lock:
-            _baseline = {k: dict(v) for k, v in WATER_BASELINE.items()}
-            _calibrated = True
+            if _calibrating:
+                self._json(409, {"cmd": "calibrate", "status": "busy",
+                                 "message": "Calibration already running"})
+                return
+            _calibrating = True
+            _cal_end = time.time() + CAL_DURATION_S
 
-        print("  baseline stored")
+        print(f"  calibration started ({CAL_DURATION_S:g}s)")
         self._json(200, {
             "cmd": "calibrate",
-            "status": "complete",
-            "baseline": _baseline,
-            "uptime_ms": int((time.time() - START) * 1000),
-            "message": "Water baseline stored",
+            "status": "started",
+            "duration_ms": int(CAL_DURATION_S * 1000),
+            "message": "Calibration started - poll /cal_status",
         })
 
     def _cal_status(self):
+        global _calibrating, _calibrated, _baseline
+
         with _lock:
+            if _calibrating and time.time() >= _cal_end:
+                _baseline = {k: dict(v) for k, v in WATER_BASELINE.items()}
+                _calibrated = True
+                _calibrating = False
+                print("  baseline stored")
+
+            progress = 0.0
+            if _calibrating:
+                progress = max(0.0, min(1.0,
+                                        1.0 - (_cal_end - time.time()) / CAL_DURATION_S))
+            elif _calibrated:
+                progress = 1.0
+
             self._json(200, {
                 "calibrated": _calibrated,
+                "calibrating": _calibrating,
+                "progress": round(progress, 2),
                 "baseline": _baseline,
                 "uptime_ms": int((time.time() - START) * 1000),
             })

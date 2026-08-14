@@ -48,6 +48,13 @@ static const char *LED_NAMES[3] = { "RED", "GREEN", "IR" };
 
 uint8_t ledPhase = 0;
 
+// Normal phase-cycle state. Declared with the other globals because setup()
+// initialises them: the IDE generates function prototypes automatically, but
+// never variable declarations, so anything used before its definition has to
+// live up here.
+unsigned long phaseStartMs = 0;
+bool phaseCaptured = false;
+
 struct Baseline
 {
   float R;
@@ -214,60 +221,102 @@ float concentrationFor(float absorbance)
   return absorbance / denom;
 }
 
-void runCalibration()
+// =====================================================
+// LED SIGNAL
+// =====================================================
+// One LED at a time, never several together. Lighting all three at once draws
+// a current spike on top of whatever the Wi-Fi radio is doing, and on a board
+// powered over USB that is enough to brown out and reset the ESP32 - which
+// looks exactly like a calibration that accepted the connection and then never
+// answered. The blink pattern carries the meaning; the count does the work.
+//
+// Blinks sit either side of the measurement window, never inside it: stray
+// light during a baseline read would corrupt the reference being captured.
+
+void blinkSignal(uint8_t times, unsigned long onMs, unsigned long offMs)
+{
+  for (uint8_t i = 0; i < times; i++)
+  {
+    allLEDsOff();
+
+    digitalWrite(RED_LED, HIGH);
+
+    delay(onMs);
+
+    allLEDsOff();
+
+    delay(offMs);
+  }
+}
+
+// =====================================================
+// CALIBRATION  (non-blocking state machine)
+// =====================================================
+// Driven a slice at a time from loop() rather than run to completion inside the
+// HTTP handler.
+//
+// Blocking for the full sweep meant the board went 11 s without servicing the
+// network stack or answering anything, so a caller could only sit and hope. Any
+// hiccup in that window - a reset, a dropped packet, a slow phase - surfaced as
+// a read timeout with no way to tell what had actually happened. Here the
+// request is acknowledged immediately and progress is published on /cal_status,
+// so the sweep can take as long as it needs and the caller always knows where
+// it got to.
+
+bool calibrating = false;
+
+uint8_t calPhase = 0;
+uint8_t calSample = 0;
+uint8_t calTaken = 0;
+bool    calSettled = false;
+
+unsigned long calPhaseStart = 0;
+
+float calSumR = 0.0f;
+float calSumG = 0.0f;
+float calSumB = 0.0f;
+float calSumC = 0.0f;
+
+void resetCalPhaseAccumulators()
+{
+  calSumR = 0.0f;
+  calSumG = 0.0f;
+  calSumB = 0.0f;
+  calSumC = 0.0f;
+
+  calSample = 0;
+  calTaken = 0;
+  calSettled = false;
+
+  calPhaseStart = millis();
+}
+
+void startCalibration()
 {
   Serial.println("{\"cmd\":\"calibrate\",\"status\":\"started\"}");
 
+  // Handshake: three fast flashes mean "command received, starting now". If you
+  // press CALIBRATE and never see this, the request did not reach the board.
+  blinkSignal(3, 100, 100);
+
+  calibrated = false;
+
   for (uint8_t phase = 0; phase < 3; phase++)
   {
-    unsigned long phaseStart = millis();
-
-    applyLed(phase);
-
-    readColor();
-
-    float sumR = 0.0f;
-    float sumG = 0.0f;
-    float sumB = 0.0f;
-    float sumC = 0.0f;
-
-    uint8_t taken = 0;
-
-    for (uint8_t i = 0; i < CAL_SAMPLES; i++)
-    {
-      if (readColor())
-      {
-        sumR += (float)rawR;
-        sumG += (float)rawG;
-        sumB += (float)rawB;
-        sumC += (float)rawC;
-
-        taken++;
-      }
-
-      unsigned long slotEnd =
-        phaseStart + (CAL_PHASE_MS * (unsigned long)(i + 1)) / CAL_SAMPLES;
-
-      while ((long)(millis() - slotEnd) < 0)
-      {
-        delay(5);
-      }
-    }
-
-    if (taken > 0)
-    {
-      baseline[phase].R = sumR / (float)taken;
-      baseline[phase].G = sumG / (float)taken;
-      baseline[phase].B = sumB / (float)taken;
-      baseline[phase].C = sumC / (float)taken;
-
-      baseline[phase].valid = (baseline[phase].C > 0.0f);
-    }
-    else
-    {
-      baseline[phase].valid = false;
-    }
+    baseline[phase].valid = false;
   }
+
+  calPhase = 0;
+  calibrating = true;
+
+  applyLed(calPhase);
+
+  resetCalPhaseAccumulators();
+}
+
+void finishCalibration()
+{
+  calibrating = false;
 
   calibrated =
     baseline[0].valid &&
@@ -283,7 +332,97 @@ void runCalibration()
   snapAbs = 0.0f;
   snapConc = 0.0f;
 
+  // Result signal, readable off the board itself:
+  //   two slow flashes  -> baseline stored
+  //   six fast flashes  -> failed, no usable light on at least one phase
+  if (calibrated)
+  {
+    blinkSignal(2, 250, 180);
+  }
+  else
+  {
+    blinkSignal(6, 70, 70);
+  }
+
+  Serial.printf(
+    "{\"cmd\":\"calibrate\",\"status\":\"%s\"}\n",
+    calibrated ? "complete" : "error"
+  );
+
   applyLed(ledPhase);
+}
+
+void calibrationStep()
+{
+  // Discard the conversion straddling the LED switch - it integrated under the
+  // previous LED.
+  if (!calSettled)
+  {
+    readColor();
+
+    calSettled = true;
+
+    return;
+  }
+
+  unsigned long slotEnd =
+    calPhaseStart + (CAL_PHASE_MS * (unsigned long)(calSample + 1)) / CAL_SAMPLES;
+
+  if ((long)(millis() - slotEnd) < 0) return;
+
+  if (readColor())
+  {
+    calSumR += (float)rawR;
+    calSumG += (float)rawG;
+    calSumB += (float)rawB;
+    calSumC += (float)rawC;
+
+    calTaken++;
+  }
+
+  calSample++;
+
+  if (calSample < CAL_SAMPLES) return;
+
+  if (calTaken > 0)
+  {
+    baseline[calPhase].R = calSumR / (float)calTaken;
+    baseline[calPhase].G = calSumG / (float)calTaken;
+    baseline[calPhase].B = calSumB / (float)calTaken;
+    baseline[calPhase].C = calSumC / (float)calTaken;
+
+    // A zero CLEAR average is an unusable reference: log10(0/I) is undefined,
+    // and every absorbance drawn from it would be meaningless.
+    baseline[calPhase].valid = (baseline[calPhase].C > 0.0f);
+  }
+  else
+  {
+    baseline[calPhase].valid = false;
+  }
+
+  calPhase++;
+
+  if (calPhase >= 3)
+  {
+    finishCalibration();
+
+    return;
+  }
+
+  applyLed(calPhase);
+
+  resetCalPhaseAccumulators();
+}
+
+// 0.0 -> 1.0 across the whole sweep, so the caller can show real progress
+// instead of guessing from a fixed countdown.
+float calibrationProgress()
+{
+  if (!calibrating) return calibrated ? 1.0f : 0.0f;
+
+  float perPhase = 1.0f / 3.0f;
+
+  return ((float)calPhase + ((float)calSample / (float)CAL_SAMPLES)) * perPhase;
 }
 
 void capturePhaseSnapshot(bool ok)
@@ -435,45 +574,47 @@ void handleSensor()
 
 void handleCalibrate()
 {
-  runCalibration();
-
-  char baselineJson[320];
-
-  buildBaselineJSON(
-    baselineJson,
-    sizeof(baselineJson)
-  );
-
-  char json[480];
-
-  snprintf(
-    json,
-    sizeof(json),
-    "{\"cmd\":\"calibrate\""
-    ",\"status\":\"%s\""
-    ",\"baseline\":%s"
-    ",\"uptime_ms\":%lu"
-    ",\"message\":\"%s\"}",
-    calibrated ? "complete" : "error",
-    baselineJson,
-    millis(),
-    calibrated
-      ? "Water baseline stored"
-      : "Calibration failed - colorimeter did not return usable light"
-  );
-
-  Serial.println(json);
-
   server.sendHeader(
     "Access-Control-Allow-Origin",
     "*"
   );
 
+  if (calibrating)
+  {
+    server.send(
+      409,
+      "application/json",
+      "{\"cmd\":\"calibrate\",\"status\":\"busy\","
+      "\"message\":\"Calibration already running\"}"
+    );
+
+    return;
+  }
+
+  // Acknowledge and return immediately. The sweep runs from loop() and the
+  // caller follows it on /cal_status - holding this connection open for the
+  // full 10 s is what made the whole operation hostage to one HTTP timeout,
+  // with no way to tell a slow phase from a board that had reset.
+  char json[240];
+
+  snprintf(
+    json,
+    sizeof(json),
+    "{\"cmd\":\"calibrate\",\"status\":\"started\""
+    ",\"duration_ms\":%lu"
+    ",\"message\":\"Calibration started - poll /cal_status\"}",
+    CAL_DURATION_MS
+  );
+
   server.send(
-    calibrated ? 200 : 503,
+    200,
     "application/json",
     json
   );
+
+  // Kicked off only after the response is on the wire, so the acknowledgement
+  // is never delayed by the handshake blink or the first phase switch.
+  startCalibration();
 }
 
 void handleCalStatus()
@@ -490,8 +631,14 @@ void handleCalStatus()
   snprintf(
     json,
     sizeof(json),
-    "{\"calibrated\":%s,\"baseline\":%s,\"uptime_ms\":%lu}",
+    "{\"calibrated\":%s"
+    ",\"calibrating\":%s"
+    ",\"progress\":%.2f"
+    ",\"baseline\":%s"
+    ",\"uptime_ms\":%lu}",
     calibrated ? "true" : "false",
+    calibrating ? "true" : "false",
+    (double)calibrationProgress(),
     baselineJson,
     millis()
   );
@@ -915,29 +1062,70 @@ void setup()
   Serial.println("================================");
 
   applyLed(0);
+
+  phaseStartMs = millis();
+  phaseCaptured = false;
 }
 
-void loop()
+// =====================================================
+// NORMAL PHASE CYCLE
+// =====================================================
+// One slice per loop() pass. Previously this was a nested for/while that owned
+// the CPU for a full 6 s rotation, which meant a calibration request could only
+// be noticed at a dwell boundary and nothing else could interleave with it.
+
+void normalStep()
 {
-  for (uint8_t phase = 0; phase < 3; phase++)
+  unsigned long now = millis();
+
+  if (!phaseCaptured)
   {
-    applyLed(phase);
-
-    unsigned long startTime = millis();
-
     bool ok = settleAndRead();
+
+    // A colorimeter that appears after a bad boot, or drops out mid-run, is
+    // picked up here rather than needing a reset.
+    haveColorimeter = ok;
 
     capturePhaseSnapshot(ok);
 
     printSerialJSON();
 
-    while (millis() - startTime < LED_DWELL_MS)
-    {
-      server.handleClient();
+    phaseCaptured = true;
 
-      maintainWifi();
-
-      delay(10);
-    }
+    return;
   }
+
+  if (now - phaseStartMs < LED_DWELL_MS) return;
+
+  ledPhase = (ledPhase + 1) % 3;
+
+  applyLed(ledPhase);
+
+  phaseStartMs = now;
+  phaseCaptured = false;
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+// Network first, every pass. The web server is serviced whatever else is going
+// on - including for the whole of a calibration sweep - so the node stays
+// answerable at all times and nothing can be left waiting on it.
+
+void loop()
+{
+  server.handleClient();
+
+  maintainWifi();
+
+  if (calibrating)
+  {
+    calibrationStep();
+  }
+  else
+  {
+    normalStep();
+  }
+
+  delay(5);
 }
