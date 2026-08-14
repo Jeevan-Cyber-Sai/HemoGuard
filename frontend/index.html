@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HemoGuard | Bed 4</title>
+<style>
+  :root {
+    --bg: #0a0f1a;
+    --card: #111827;
+    --edge: #1f2937;
+    --label: #94a3b8;
+    --value: #e8eef7;
+    --green: #00c853;
+    --amber: #ffab00;
+    --red: #d50000;
+    --triage: var(--green);
+    --sans: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--value);
+    font-family: var(--sans);
+  }
+
+  .app {
+    height: 100vh;
+    display: grid;
+    grid-template-rows: 64px 1.15fr 1.15fr 92px 1.5fr;
+    gap: 10px;
+    padding: 10px;
+  }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    background: var(--card);
+    border: 1px solid var(--edge);
+    border-radius: 8px;
+    padding: 0 20px;
+  }
+  .brand {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: 3px;
+  }
+  .brand span { color: var(--triage); transition: color .3s; }
+  .bed {
+    font-family: var(--mono);
+    font-size: 20px;
+    color: var(--label);
+    padding-left: 20px;
+    border-left: 1px solid var(--edge);
+  }
+  .badge {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    padding: 8px 18px;
+    border-radius: 6px;
+    border: 2px solid var(--green);
+    color: var(--green);
+  }
+  .badge.stale { border-color: var(--amber); color: var(--amber); }
+  .dot {
+    width: 11px; height: 11px;
+    border-radius: 50%;
+    background: currentColor;
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 50% { opacity: .25; } }
+  .clock {
+    font-family: var(--mono);
+    font-size: 17px;
+    color: var(--label);
+  }
+
+  /* ---------- cards ---------- */
+  .row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    min-height: 0;
+  }
+  .card {
+    position: relative;
+    background: var(--card);
+    border: 2px solid var(--triage);
+    border-radius: 8px;
+    padding: 14px 20px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: 0;
+    overflow: hidden;
+    transition: border-color .3s;
+  }
+  .card .label {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 2.5px;
+    color: var(--label);
+    text-transform: uppercase;
+  }
+  .readout { display: flex; align-items: baseline; gap: 10px; margin-top: 6px; }
+  .value {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: clamp(38px, 6.2vw, 92px);
+    line-height: 1;
+    letter-spacing: -1px;
+    font-variant-numeric: tabular-nums;
+  }
+  .value.mid { font-size: clamp(30px, 4.4vw, 64px); }
+  .unit {
+    font-family: var(--mono);
+    font-size: clamp(14px, 1.5vw, 24px);
+    color: var(--label);
+  }
+
+  /* stale treatment */
+  body.stale .card .readout,
+  body.stale .card .gauge-wrap,
+  body.stale .chan-grid,
+  body.stale .led-badge { opacity: .4; }
+  /* Anchored bottom-right rather than centred: the values are top-left aligned,
+     and a watermark sitting across them costs exactly the 2-3 m readability the
+     numerals exist for. */
+  body.stale .card::after {
+    content: "STALE";
+    position: absolute;
+    right: 14px;
+    bottom: 8px;
+    font-family: var(--mono);
+    font-size: clamp(16px, 1.7vw, 28px);
+    font-weight: 700;
+    letter-spacing: 6px;
+    color: var(--amber);
+    opacity: .45;
+    transform: rotate(-8deg);
+    pointer-events: none;
+  }
+
+  /* ---------- z-risk gauge ---------- */
+  .gauge-card { align-items: center; }
+  .gauge-wrap { position: relative; width: 100%; flex: 1; min-height: 0; display: grid; place-items: center; }
+  .gauge-wrap svg { width: 100%; height: 100%; max-height: 150px; display: block; }
+  .gauge-track { stroke: #1e293b; }
+  .gauge-fill { stroke: var(--triage); transition: stroke-dashoffset .45s ease, stroke .3s; }
+  .gauge-num {
+    position: absolute;
+    left: 50%;
+    bottom: 0;
+    transform: translateX(-50%);
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: clamp(28px, 3.6vw, 54px);
+    color: var(--triage);
+    font-variant-numeric: tabular-nums;
+    transition: color .3s;
+  }
+  .gauge-ends {
+    position: absolute; inset: 0;
+    pointer-events: none;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--label);
+  }
+  .gauge-ends b { position: absolute; bottom: 8px; font-weight: 400; }
+  .gauge-ends b.lo { left: 4%; }
+  .gauge-ends b.hi { right: 4%; }
+  body.stale .gauge-ends { opacity: 0; }   /* would collide with the watermark */
+
+  /* ---------- triage band ---------- */
+  .triage-band {
+    display: flex;
+    align-items: center;
+    gap: 22px;
+    background: var(--card);
+    border: 2px solid var(--triage);
+    border-radius: 8px;
+    padding: 0 22px;
+    overflow: hidden;
+  }
+  .triage-band .label {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 2.5px;
+    color: var(--label);
+  }
+  .triage-swatch {
+    width: 46px; height: 46px;
+    border-radius: 5px;
+    background: var(--triage);
+    box-shadow: 0 0 22px var(--triage);
+    transition: background .3s, box-shadow .3s;
+  }
+  .triage-text {
+    font-family: var(--mono);
+    font-size: clamp(28px, 3.4vw, 50px);
+    font-weight: 700;
+    letter-spacing: 5px;
+    color: var(--triage);
+    transition: color .3s;
+  }
+  #ack {
+    margin-left: auto;
+    display: none;
+    font-family: var(--sans);
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: 2.5px;
+    padding: 15px 34px;
+    border-radius: 6px;
+    border: 2px solid var(--red);
+    background: var(--red);
+    color: #fff;
+    cursor: pointer;
+  }
+  #ack:hover { background: #ff1744; }
+  #ack.visible { display: block; }
+  .ack-note {
+    margin-left: auto;
+    display: none;
+    font-family: var(--mono);
+    font-size: 16px;
+    letter-spacing: 2px;
+    color: var(--label);
+  }
+  .ack-note.visible { display: block; }
+
+  /* ---------- bottom row ---------- */
+  .bottom {
+    display: grid;
+    grid-template-columns: minmax(240px, 1fr) 3fr;
+    gap: 10px;
+    min-height: 0;
+  }
+  .chan-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 10px;
+    flex: 1;
+    min-height: 0;
+  }
+  .chan {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-family: var(--mono);
+    font-size: clamp(16px, 1.7vw, 27px);
+    font-weight: 700;
+  }
+  .swatch { width: 13px; height: 26px; border-radius: 3px; flex: none; }
+  .led-badge {
+    margin-top: 10px;
+    text-align: center;
+    font-family: var(--mono);
+    font-size: clamp(15px, 1.5vw, 22px);
+    font-weight: 700;
+    letter-spacing: 3px;
+    padding: 9px;
+    border-radius: 5px;
+    border: 2px solid var(--edge);
+  }
+  .spark-stack {
+    display: grid;
+    grid-template-rows: 1fr 1fr;
+    gap: 10px;
+    min-height: 0;
+  }
+  .spark-card { padding: 10px 14px; }
+  .spark-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  .spark-head .label { font-size: 13px; }
+  .spark-head .rng {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--label);
+  }
+  canvas { width: 100%; flex: 1; min-height: 0; display: block; }
+
+  /* ---------- critical flash ---------- */
+  #flash {
+    position: fixed;
+    inset: 0;
+    background: var(--red);
+    opacity: 0;
+    pointer-events: none;
+    z-index: 9999;
+  }
+  #flash.on { animation: flash 2s infinite; }
+  @keyframes flash {
+    0%, 100% { opacity: 0; }
+    8%       { opacity: .42; }
+    22%      { opacity: 0; }
+  }
+
+  /* ---------- audio unlock ---------- */
+  #audio-gate {
+    position: fixed;
+    left: 50%; bottom: 18px;
+    transform: translateX(-50%);
+    z-index: 10000;
+    display: none;
+    align-items: center;
+    gap: 12px;
+    background: var(--card);
+    border: 2px solid var(--amber);
+    border-radius: 8px;
+    padding: 13px 24px;
+    font-size: 16px;
+    color: var(--amber);
+    cursor: pointer;
+  }
+  #audio-gate.visible { display: flex; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <div class="brand">HEMO<span>GUARD</span></div>
+    <div class="bed">BED 4</div>
+    <div class="clock" id="clock">--:--:--</div>
+    <div class="badge" id="badge"><i class="dot"></i><span id="badge-text">CONNECTING</span></div>
+  </header>
+
+  <!-- primary vitals -->
+  <div class="row">
+    <div class="card">
+      <div class="label">Weight</div>
+      <div class="readout"><span class="value" id="weight">--.-</span><span class="unit">g</span></div>
+    </div>
+    <div class="card">
+      <div class="label">SpO&#8322;</div>
+      <div class="readout"><span class="value" id="spo2">--</span><span class="unit">%</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Pulse Rate</div>
+      <div class="readout"><span class="value" id="pulse">--</span><span class="unit">bpm</span></div>
+    </div>
+  </div>
+
+  <!-- derived metrics -->
+  <div class="row">
+    <div class="card">
+      <div class="label">Bleeding Rate</div>
+      <div class="readout"><span class="value mid" id="rate">0.0</span><span class="unit">mL/min</span></div>
+    </div>
+    <div class="card">
+      <div class="label">Hb Ratio</div>
+      <div class="readout"><span class="value mid" id="hb">0.00</span></div>
+    </div>
+    <div class="card gauge-card">
+      <div class="label" style="align-self:flex-start">Z-Risk</div>
+      <div class="gauge-wrap">
+        <svg viewBox="0 0 200 108" preserveAspectRatio="xMidYMax meet">
+          <path class="gauge-track" d="M 18 96 A 82 82 0 0 1 182 96"
+                fill="none" stroke-width="17" stroke-linecap="round"/>
+          <path class="gauge-fill" id="gauge" d="M 18 96 A 82 82 0 0 1 182 96"
+                fill="none" stroke-width="17" stroke-linecap="round"/>
+        </svg>
+        <div class="gauge-ends"><b class="lo">0</b><b class="hi">15+</b></div>
+        <div class="gauge-num" id="zrisk">0.00</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- triage -->
+  <div class="triage-band">
+    <div class="label">TRIAGE BAND</div>
+    <div class="triage-swatch"></div>
+    <div class="triage-text" id="triage-text">LOW</div>
+    <button id="ack">ACKNOWLEDGE</button>
+    <div class="ack-note" id="ack-note">ACKNOWLEDGED</div>
+  </div>
+
+  <!-- optical + trends -->
+  <div class="bottom">
+    <div class="card">
+      <div class="label">Optical Sensor</div>
+      <div class="chan-grid">
+        <div class="chan"><i class="swatch" style="background:#ff5252"></i><span id="ch-r">---</span></div>
+        <div class="chan"><i class="swatch" style="background:#69f0ae"></i><span id="ch-g">---</span></div>
+        <div class="chan"><i class="swatch" style="background:#448aff"></i><span id="ch-b">---</span></div>
+        <div class="chan"><i class="swatch" style="background:#e0e0e0"></i><span id="ch-c">---</span></div>
+      </div>
+      <div class="led-badge" id="led">LED --</div>
+    </div>
+
+    <div class="spark-stack">
+      <div class="card spark-card">
+        <div class="spark-head">
+          <div class="label">Weight Trend &mdash; 60 pts</div>
+          <div class="rng" id="w-range">auto</div>
+        </div>
+        <canvas id="spark-weight"></canvas>
+      </div>
+      <div class="card spark-card">
+        <div class="spark-head">
+          <div class="label">Z-Risk Trend &mdash; 60 pts</div>
+          <div class="rng">0 &ndash; 15</div>
+        </div>
+        <canvas id="spark-zrisk"></canvas>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div id="flash"></div>
+<div id="audio-gate">&#128266;&nbsp; Click anywhere to enable alarm audio</div>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------
+   config
+------------------------------------------------------------------ */
+// Opened over file:// the hostname is empty, so fall back to localhost.
+const HOST      = location.hostname || "localhost";
+const WS_URL    = `ws://${HOST}:8000/ws`;
+const API_URL   = `http://${HOST}:8000`;
+const RETRY_MS  = 3000;
+const MAX_POINTS = 60;
+const GAUGE_CAP  = 15;          // visual clip only; the label shows the true value
+const ARC_LENGTH = Math.PI * 82; // radius 82 semicircle
+
+const COLOURS = { green: "#00c853", amber: "#ffab00", red: "#d50000" };
+const TRIAGE_TEXT = { green: "LOW", amber: "WATCH", red: "CRITICAL" };
+
+/* ------------------------------------------------------------------
+   state
+------------------------------------------------------------------ */
+let socket = null;
+let retryTimer = null;
+let currentTriage = "green";
+let acknowledged = false;
+let alarmRunning = false;
+let lastPlotted = null;   // timestamp of the last reading added to the trends
+const weightHistory = [];
+const zriskHistory = [];
+
+const $ = (id) => document.getElementById(id);
+
+/* ------------------------------------------------------------------
+   audio  (Web Audio API only - no files)
+------------------------------------------------------------------ */
+let audioCtx = null;
+let alarmTimer = null;
+
+function ensureAudio() {
+  if (!audioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    audioCtx = new Ctx();
+  }
+  if (audioCtx.state === "suspended") audioCtx.resume();
+  return audioCtx;
+}
+
+// Browsers block audio until the user interacts with the page. Show a prompt
+// while that is still true so a silent alarm is never mistaken for no alarm.
+function audioBlocked() {
+  return !audioCtx || audioCtx.state !== "running";
+}
+function refreshAudioGate() {
+  $("audio-gate").classList.toggle("visible", audioBlocked());
+}
+
+function beep(freq, type, ms, peak) {
+  const ctx = ensureAudio();
+  if (!ctx || ctx.state !== "running") return;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  const now = ctx.currentTime;
+  const dur = ms / 1000;
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(peak, now + 0.012);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(now);
+  osc.stop(now + dur + 0.02);
+}
+
+// Soft chime: 880 Hz sine, 200 ms, fades out.
+function chime() { beep(880, "sine", 200, 0.16); }
+
+// Alarm: 440 Hz square, 500 ms on / 300 ms off, looping.
+function startAlarm() {
+  if (alarmRunning) return;
+  alarmRunning = true;
+  const fire = () => beep(440, "square", 500, 0.22);
+  fire();
+  alarmTimer = setInterval(fire, 800);
+}
+function stopAlarm() {
+  alarmRunning = false;
+  if (alarmTimer) { clearInterval(alarmTimer); alarmTimer = null; }
+}
+
+function unlockAudio() {
+  ensureAudio();
+  refreshAudioGate();
+  // If we went critical before audio was permitted, start the alarm now.
+  if (currentTriage === "red" && !acknowledged && !alarmRunning) startAlarm();
+}
+["click", "keydown", "touchstart"].forEach((evt) =>
+  document.addEventListener(evt, unlockAudio, { passive: true })
+);
+
+/* ------------------------------------------------------------------
+   alerts
+------------------------------------------------------------------ */
+function applyTriage(triage) {
+  const band = COLOURS[triage] ? triage : "green";
+  const changed = band !== currentTriage;
+
+  if (changed) {
+    document.documentElement.style.setProperty("--triage", COLOURS[band]);
+    $("triage-text").textContent = TRIAGE_TEXT[band];
+
+    // Leaving critical clears the acknowledgement, so the next escalation alarms.
+    if (currentTriage === "red" && band !== "red") acknowledged = false;
+    if (band === "amber") chime();
+    currentTriage = band;
+  }
+
+  const critical = band === "red";
+  const alarming = critical && !acknowledged;
+
+  if (alarming) startAlarm(); else stopAlarm();
+  $("flash").classList.toggle("on", alarming);
+  // The button is offered only while critical and not yet acknowledged.
+  $("ack").classList.toggle("visible", critical && !acknowledged);
+  $("ack-note").classList.toggle("visible", critical && acknowledged);
+
+  if (critical) refreshAudioGate(); else $("audio-gate").classList.remove("visible");
+}
+
+$("ack").addEventListener("click", (e) => {
+  e.stopPropagation();
+  acknowledged = true;      // silences sound + flash; red colour stays
+  stopAlarm();
+  $("flash").classList.remove("on");
+  $("ack").classList.remove("visible");
+  $("ack-note").classList.add("visible");
+});
+
+/* ------------------------------------------------------------------
+   sparklines
+------------------------------------------------------------------ */
+function sizeCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return null;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+function drawSpark(canvas, data, opts) {
+  const sized = sizeCanvas(canvas);
+  if (!sized) return;
+  const { ctx, w, h } = sized;
+  const pad = 4;
+
+  ctx.clearRect(0, 0, w, h);
+
+  // baseline grid
+  ctx.strokeStyle = "#1e293b";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = pad + ((h - pad * 2) * i) / 4;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  if (data.length < 2) return;
+
+  let lo, hi;
+  if (opts.fixed) {
+    lo = opts.min; hi = opts.max;
+  } else {
+    lo = Math.min(...data); hi = Math.max(...data);
+    if (hi - lo < 1e-9) { lo -= 0.5; hi += 0.5; }   // flat line sits mid-card
+    const margin = (hi - lo) * 0.12;
+    lo -= margin; hi += margin;
+  }
+
+  const span = hi - lo || 1;
+  // Anchor to MAX_POINTS so the trace grows in from the left instead of
+  // rescaling horizontally on every reading.
+  const stepX = (w - pad * 2) / (MAX_POINTS - 1);
+  const pt = (v, i) => [
+    pad + i * stepX,
+    pad + (h - pad * 2) * (1 - Math.min(1, Math.max(0, (v - lo) / span))),
+  ];
+
+  // fill under the trace
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, opts.colour + "44");
+  grad.addColorStop(1, opts.colour + "00");
+  ctx.beginPath();
+  ctx.moveTo(...pt(data[0], 0));
+  data.forEach((v, i) => ctx.lineTo(...pt(v, i)));
+  ctx.lineTo(pad + (data.length - 1) * stepX, h - pad);
+  ctx.lineTo(pad, h - pad);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // trace
+  ctx.beginPath();
+  data.forEach((v, i) => (i ? ctx.lineTo(...pt(v, i)) : ctx.moveTo(...pt(v, i))));
+  ctx.strokeStyle = opts.colour;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.stroke();
+
+  // head marker
+  const [hx, hy] = pt(data[data.length - 1], data.length - 1);
+  ctx.beginPath();
+  ctx.arc(hx, hy, 3.2, 0, Math.PI * 2);
+  ctx.fillStyle = opts.colour;
+  ctx.fill();
+}
+
+function redrawSparks() {
+  drawSpark($("spark-weight"), weightHistory, { colour: "#38bdf8" });
+  drawSpark($("spark-zrisk"), zriskHistory, {
+    colour: COLOURS[currentTriage], fixed: true, min: 0, max: GAUGE_CAP,
+  });
+  if (weightHistory.length) {
+    const lo = Math.min(...weightHistory), hi = Math.max(...weightHistory);
+    $("w-range").textContent = `${lo.toFixed(1)} – ${hi.toFixed(1)} g`;
+  }
+}
+window.addEventListener("resize", redrawSparks);
+
+/* ------------------------------------------------------------------
+   rendering
+------------------------------------------------------------------ */
+const num = (v, dp, fallback) =>
+  (v === null || v === undefined || Number.isNaN(Number(v)))
+    ? fallback
+    : Number(v).toFixed(dp);
+
+function setGauge(z) {
+  const frac = Math.min(1, Math.max(0, (Number(z) || 0) / GAUGE_CAP));
+  $("gauge").style.strokeDasharray = ARC_LENGTH;
+  $("gauge").style.strokeDashoffset = ARC_LENGTH * (1 - frac);
+  $("zrisk").textContent = num(z, 2, "0.00");   // true value, uncapped
+}
+
+function render(payload) {
+  if (!payload || typeof payload !== "object") return;
+
+  const stale = payload.status === "stale" || payload.status === "offline";
+  document.body.classList.toggle("stale", stale);
+  $("badge").classList.toggle("stale", stale);
+  $("badge-text").textContent = stale ? "STALE" : "LIVE";
+
+  if (payload.weight !== undefined) $("weight").textContent = num(payload.weight, 1, "--.-");
+  if (payload.spo2 !== undefined)   $("spo2").textContent   = num(payload.spo2, 0, "--");
+  if (payload.pulse !== undefined)  $("pulse").textContent  = num(payload.pulse, 0, "--");
+  if (payload.bleeding_rate !== undefined) $("rate").textContent = num(payload.bleeding_rate, 1, "0.0");
+  if (payload.hb_ratio !== undefined)      $("hb").textContent   = num(payload.hb_ratio, 2, "0.00");
+
+  if (payload.red !== undefined)   $("ch-r").textContent = `R ${payload.red}`;
+  if (payload.green !== undefined) $("ch-g").textContent = `G ${payload.green}`;
+  if (payload.blue !== undefined)  $("ch-b").textContent = `B ${payload.blue}`;
+  if (payload.clear !== undefined) $("ch-c").textContent = `C ${payload.clear}`;
+
+  if (payload.led !== undefined && payload.led !== null) {
+    const led = $("led");
+    led.textContent = `LED ${payload.led}`;
+    const known = { RED: COLOURS.red, GREEN: COLOURS.green, AMBER: COLOURS.amber,
+                    YELLOW: COLOURS.amber, BLUE: "#448aff" };
+    const tint = known[String(payload.led).toUpperCase()] || "#94a3b8";
+    led.style.borderColor = tint;
+    led.style.color = tint;
+  }
+
+  if (payload.z_risk !== undefined) setGauge(payload.z_risk);
+  if (payload.triage) applyTriage(payload.triage);
+
+  // Plot each reading once. A stale repeat re-sends the last reading, and the
+  // REST pre-populate is immediately echoed by the WebSocket priming frame -
+  // both would otherwise duplicate a point in the trends.
+  const fresh = payload.timestamp && payload.timestamp !== lastPlotted;
+  if (!stale && payload.status === "live" && fresh) {
+    lastPlotted = payload.timestamp;
+    if (typeof payload.weight === "number") {
+      weightHistory.push(payload.weight);
+      if (weightHistory.length > MAX_POINTS) weightHistory.shift();
+    }
+    if (typeof payload.z_risk === "number") {
+      zriskHistory.push(payload.z_risk);
+      if (zriskHistory.length > MAX_POINTS) zriskHistory.shift();
+    }
+  }
+  redrawSparks();
+}
+
+/* ------------------------------------------------------------------
+   transport
+------------------------------------------------------------------ */
+async function primeFromRest() {
+  try {
+    const res = await fetch(`${API_URL}/latest`, { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data && data.status !== "waiting") render(data);
+  } catch (err) {
+    // Backend down, or CORS refused it - the WebSocket is the real feed anyway.
+    console.warn("prime failed:", err.message);
+  }
+}
+
+function markOffline() {
+  document.body.classList.add("stale");
+  $("badge").classList.add("stale");
+  $("badge-text").textContent = "STALE";
+}
+
+function connect() {
+  clearTimeout(retryTimer);
+  try {
+    socket = new WebSocket(WS_URL);
+  } catch (err) {
+    retryTimer = setTimeout(connect, RETRY_MS);
+    return;
+  }
+
+  socket.addEventListener("open", () => {
+    $("badge").classList.remove("stale");
+    $("badge-text").textContent = "LIVE";
+    document.body.classList.remove("stale");
+  });
+
+  socket.addEventListener("message", (evt) => {
+    try { render(JSON.parse(evt.data)); }
+    catch (err) { console.warn("bad frame:", err.message); }
+  });
+
+  socket.addEventListener("close", () => {
+    markOffline();
+    retryTimer = setTimeout(connect, RETRY_MS);   // retry every 3 s
+  });
+
+  socket.addEventListener("error", () => {
+    try { socket.close(); } catch (e) { /* close() triggers the retry */ }
+  });
+}
+
+/* ------------------------------------------------------------------
+   boot
+------------------------------------------------------------------ */
+setInterval(() => {
+  $("clock").textContent = new Date().toLocaleTimeString("en-GB");
+}, 1000);
+
+redrawSparks();
+primeFromRest().finally(connect);
+
+// Exposed so the payload can be exercised without a backend attached.
+window.hemoguard = {
+  render,
+  state: () => ({ triage: currentTriage, acknowledged, alarmRunning,
+                  points: weightHistory.length }),
+};
+</script>
+</body>
+</html>

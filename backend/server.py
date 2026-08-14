@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -391,6 +392,16 @@ async def lifespan(app):
 
 
 app = FastAPI(title="HemoGuard", lifespan=lifespan)
+
+# The dashboard is opened straight from disk during development, which makes its
+# origin "null" - without this, GET /latest is blocked and the page cannot
+# pre-populate before the first WebSocket message.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
