@@ -4,3 +4,4 @@ sensor_data.json
 .sensor_data.json.tmp
 logs/
 .venv/
+firmware/**/secrets.h

@@ -1,34 +1,41 @@
 """HemoGuard backend.
 
-Watches sensor_data.json (written by serial_reader.py), scores each reading with
-the Z-score risk engine, logs it to CSV, and broadcasts it to every connected
+Polls the ESP32's GET /sensor endpoint over Wi-Fi, scores each reading with the
+Z-score risk engine, logs it to CSV, and broadcasts it to every connected
 WebSocket client.
 
 Run with:
+    set HEMOGUARD_ESP32_IP=192.168.1.45
     uvicorn backend.server:app --host 0.0.0.0 --port 8000 --reload
 """
 
 import asyncio
 import csv
-import json
 import os
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
+from fastapi.staticfiles import StaticFiles
 
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-SENSOR_FILE = Path(os.environ.get("HEMOGUARD_SENSOR_FILE", BASE_DIR / "sensor_data.json"))
 LOG_FILE = Path(os.environ.get("HEMOGUARD_LOG_FILE", BASE_DIR / "logs" / "experiment_log.csv"))
+
+# Address of the sensor node. A port may be included (e.g. "192.168.1.45:8080");
+# without one it defaults to port 80, which is where the ESP32 web server lives.
+ESP32_IP = os.environ.get("HEMOGUARD_ESP32_IP", "").strip()
+SENSOR_URL = f"http://{ESP32_IP}/sensor" if ESP32_IP else ""
+
+POLL_INTERVAL_SECONDS = 1.0
+POLL_TIMEOUT_SECONDS = 2.0   # must stay below the interval budget
 
 # Origins permitted to call the REST endpoints. An origin is an exact
 # scheme+host+port match, so a dashboard served on :8000 needs the port spelled
@@ -75,6 +82,13 @@ AMBER_THRESHOLD = 1.0
 RED_THRESHOLD = 2.5
 CONSECUTIVE_CRITICAL_REQUIRED = 2  # anti-spike: two cycles at >= 2.5 to escalate
 
+# How many consecutive invalid readings may be papered over by replaying the
+# last good scores. A dropped frame or two is worth riding out; past that the
+# held band stops being evidence of anything. A latched red alarms over a
+# patient nobody is measuring, and a latched green hides a bleed that began
+# after the sensor died - so the band degrades to an explicit unknown instead.
+CONSECUTIVE_INVALID_LIMIT = 7   # ~15 s at the node's 2 s phase cadence
+
 # The colorimeter only sees blood colour usefully under the red illumination
 # LED - the TCS34725's IR-blocking filter makes the IR phase read near-black,
 # and green shifts the ratio wholesale. Only this phase feeds z_hb.
@@ -83,7 +97,14 @@ RED_PHASE_LED = "RED"
 CSV_COLUMNS = [
     "timestamp", "weight_g", "spo2", "pulse_bpm", "red", "green", "blue",
     "clear", "led", "bleeding_rate", "hb_ratio", "z_risk", "triage", "valid",
+    "scored_channels",
 ]
+
+# Display-only fields the node may add. They are forwarded to the dashboard
+# untouched and never scored: norm_* are clear-normalised 0-255 values, the
+# wrong units for hb_ratio, which always uses the raw red/green/blue/clear
+# counts so it stays comparable with BASELINE_HB.
+PASSTHROUGH_FIELDS = ("norm_r", "norm_g", "norm_b", "hex")
 
 
 # --------------------------------------------------------------------------
@@ -141,17 +162,29 @@ class RiskEngine:
         return float(red) / total
 
     @staticmethod
-    def _reading_spo2(reading):
-        """SpO2 as a number, or None when the oximeter had nothing to report.
+    def _optional(reading, field, zero_is_absent=True):
+        """One channel as a number, or None when it has nothing to report.
 
-        The firmware sends 0 for a failed read. Scored literally that is a
-        65-sigma desaturation, so it must be treated as absent, not as 0%.
+        Two different things both mean "do not score this":
+          - JSON null, sent by a node where the sensor is not fitted at all
+            (the colour node reports weight/spo2/pulse this way);
+          - the firmware's 0 failure sentinel. Scored literally, spo2=0 is a
+            65-sigma desaturation and pulse=0 a 6-sigma bradycardia.
+
+        Weight passes zero_is_absent=False: an empty drape genuinely weighs
+        0.0 g, and reading that as absent would blind the bleeding rate for
+        exactly as long as the patient is not bleeding.
         """
+        value = reading.get(field)
+        if value is None:
+            return None
         try:
-            value = float(reading.get("spo2"))
+            value = float(value)
         except (TypeError, ValueError):
             return None
-        return None if value <= 0 else value
+        if zero_is_absent and value <= 0:
+            return None
+        return value
 
     def hold(self):
         """Last computed scores, unchanged - used when a reading is invalid.
@@ -161,13 +194,17 @@ class RiskEngine:
         reading left them.
         """
         if self.last_scored is None:
-            return {"bleeding_rate": 0.0, "hb_ratio": 0.0, "z_rate": 0.0,
+            return {"bleeding_rate": None, "hb_ratio": None, "z_rate": 0.0,
                     "z_hb": 0.0, "z_pr": 0.0, "z_spo2": 0.0, "z_risk": 0.0,
-                    "triage": "green"}
+                    "triage": "green", "scored_channels": []}
         return dict(self.last_scored)
 
     def score(self, reading, moment):
-        rate = self.bleeding_rate(reading.get("weight", 0), moment)
+        # Absent weight must not reach the rolling window: appending a
+        # placeholder would fabricate a slope out of nothing, and clearing the
+        # window would discard history a load cell may still be feeding.
+        weight = self._optional(reading, "weight", zero_is_absent=False)
+        rate = self.bleeding_rate(weight, moment) if weight is not None else None
 
         # Only the red illumination phase produces a meaningful blood-colour
         # ratio. Other phases hold the last red-phase value rather than
@@ -181,33 +218,53 @@ class RiskEngine:
         ratio = self.red_phase_ratio if self.red_phase_ratio is not None else 0.0
         scored_hb = self.red_phase_ratio is not None
 
-        pulse = float(reading.get("pulse", BASELINE_PULSE[0]))
-        spo2 = self._reading_spo2(reading)
+        pulse = self._optional(reading, "pulse")
+        spo2 = self._optional(reading, "spo2")
 
-        z_rate = max(0.0, (rate - BASELINE_RATE[0]) / BASELINE_RATE[1])
+        z_rate = 0.0 if rate is None else max(
+            0.0, (rate - BASELINE_RATE[0]) / BASELINE_RATE[1])
         z_hb = max(0.0, (ratio - BASELINE_HB[0]) / BASELINE_HB[1]) if scored_hb else 0.0
-        z_pr = max(0.0, (pulse - BASELINE_PULSE[0]) / BASELINE_PULSE[1])
+        z_pr = 0.0 if pulse is None else max(
+            0.0, (pulse - BASELINE_PULSE[0]) / BASELINE_PULSE[1])
         z_spo2 = 0.0 if spo2 is None else max(
             0.0, (BASELINE_SPO2[0] - spo2) / BASELINE_SPO2[1])
 
-        z_risk = (
-            WEIGHTS["rate"] * z_rate
-            + WEIGHTS["hb"] * z_hb
-            + WEIGHTS["pr"] * z_pr
-            + WEIGHTS["spo2"] * z_spo2
-        )
+        # Score over the channels this node actually reports, renormalised by
+        # their share of the weighting. A sensor that is not fitted must not
+        # dilute the score towards green: on the colour-only node the fixed
+        # formula caps z_risk at 0.30 * z_hb, which can never reach the 2.5 red
+        # threshold no matter how much blood the colorimeter sees.
+        #
+        # With all four channels present the divisor is 1.0, so this is exactly
+        # the original weighted sum.
+        present = {}
+        if rate is not None:
+            present["rate"] = z_rate
+        if scored_hb:
+            present["hb"] = z_hb
+        if pulse is not None:
+            present["pr"] = z_pr
+        if spo2 is not None:
+            present["spo2"] = z_spo2
+
+        share = sum(WEIGHTS[name] for name in present)
+        if share > 0:
+            z_risk = sum(WEIGHTS[name] * z for name, z in present.items()) / share
+        else:
+            z_risk = 0.0
 
         triage = self._triage(z_risk)
 
         self.last_scored = {
-            "bleeding_rate": round(rate, 3),
-            "hb_ratio": round(ratio, 4),
+            "bleeding_rate": None if rate is None else round(rate, 3),
+            "hb_ratio": round(ratio, 4) if scored_hb else None,
             "z_rate": round(z_rate, 3),
             "z_hb": round(z_hb, 3),
             "z_pr": round(z_pr, 3),
             "z_spo2": round(z_spo2, 3),
             "z_risk": round(z_risk, 3),
             "triage": triage,
+            "scored_channels": sorted(present),
         }
         return dict(self.last_scored)
 
@@ -226,6 +283,29 @@ class RiskEngine:
 # --------------------------------------------------------------------------
 # CSV logging
 # --------------------------------------------------------------------------
+
+def rotate_if_schema_changed():
+    """Retire a log whose header predates the current CSV_COLUMNS.
+
+    Appending wider rows under a narrower header silently shifts every column
+    from that point on, which is worse than losing the file: the older rows
+    still parse, just wrongly. The old log is renamed rather than deleted so
+    the earlier run stays available.
+    """
+    if not LOG_FILE.exists() or LOG_FILE.stat().st_size == 0:
+        return
+
+    with open(LOG_FILE, "r", newline="", encoding="utf-8") as handle:
+        header = next(csv.reader(handle), None)
+
+    if header == CSV_COLUMNS:
+        return
+
+    retired = LOG_FILE.with_name(
+        f"{LOG_FILE.stem}.{datetime.now():%Y%m%dT%H%M%S}{LOG_FILE.suffix}")
+    LOG_FILE.rename(retired)
+    print(f"Log schema changed - previous log retired to {retired.name}")
+
 
 def append_to_csv(payload):
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -250,6 +330,7 @@ def append_to_csv(payload):
             payload.get("z_risk"),
             payload.get("triage"),
             payload.get("valid"),
+            "|".join(payload.get("scored_channels") or []),
         ])
 
 
@@ -295,19 +376,17 @@ class ConnectionManager:
 manager = ConnectionManager()
 engine = RiskEngine()
 
-latest_payload = {"status": "waiting", "triage": "green", "z_risk": 0.0}
+# triage starts unknown, not green: before the first reading arrives the system
+# has measured nothing, and a reassuring green LOW on a dashboard that has never
+# seen the patient is the wrong default.
+latest_payload = {"status": "waiting", "triage": "unknown", "z_risk": None}
 last_reading_time = None   # datetime of the most recent accepted reading
-last_seen_timestamp = None # dedupes repeated watchdog events for one write
+last_seen_uptime = None    # device uptime_ms of the last reading we processed
 currently_stale = False
+consecutive_invalid = 0    # runs of readings the node flagged valid:false
 
-
-def parse_timestamp(value):
-    if isinstance(value, str):
-        try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            pass
-    return None
+# Fields the ESP32 must supply for a response to count as a reading.
+REQUIRED_FIELDS = ("weight", "spo2", "pulse", "red", "green", "blue", "clear", "led")
 
 
 def reading_is_valid(reading):
@@ -317,11 +396,27 @@ def reading_is_valid(reading):
 
 
 def build_payload(reading, moment):
-    # An invalid reading means at least one sensor failed. Scoring it would
-    # feed failure sentinels into the engine, so the previous scores and triage
-    # band are carried forward untouched and the frame is flagged instead.
+    # An invalid reading means a sensor that was supposed to answer did not.
+    # Scoring it would feed failure sentinels into the engine, so the previous
+    # scores are carried forward and the frame is flagged instead - but only
+    # for CONSECUTIVE_INVALID_LIMIT readings, after which the band is no longer
+    # presented as a live assessment.
+    global consecutive_invalid
+
     valid = reading_is_valid(reading)
-    scored = engine.score(reading, moment) if valid else engine.hold()
+
+    if valid:
+        consecutive_invalid = 0
+        scored = engine.score(reading, moment)
+        status = "live"
+    else:
+        consecutive_invalid += 1
+        scored = engine.hold()
+        if consecutive_invalid >= CONSECUTIVE_INVALID_LIMIT:
+            status = "sensor_fault"
+            scored = dict(scored, triage="unknown", z_risk=None)
+        else:
+            status = "sensor_invalid"
 
     payload = {
         "timestamp": reading.get("timestamp") or moment.isoformat(timespec="milliseconds"),
@@ -334,41 +429,43 @@ def build_payload(reading, moment):
         "clear": reading.get("clear"),
         "led": reading.get("led"),
         "valid": valid,
-        "status": "live" if valid else "sensor_invalid",
+        "status": status,
     }
+    for field in PASSTHROUGH_FIELDS:
+        if field in reading:
+            payload[field] = reading[field]
     payload.update(scored)
     return payload
 
 
-async def process_sensor_file():
-    """Read the sensor file, score it, log it, broadcast it."""
-    global latest_payload, last_reading_time, last_seen_timestamp, currently_stale
-
-    try:
-        with open(SENSOR_FILE, "r", encoding="utf-8") as handle:
-            reading = json.load(handle)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return  # mid-write or absent; the next event will pick it up
+async def handle_reading(reading):
+    """Score one reading from the node, log it, broadcast it."""
+    global latest_payload, last_reading_time, last_seen_uptime, currently_stale
 
     if not isinstance(reading, dict):
         return
 
-    file_timestamp = reading.get("timestamp")
-    if file_timestamp is not None and file_timestamp == last_seen_timestamp:
-        return  # duplicate watchdog event for a write we already handled
-    last_seen_timestamp = file_timestamp
-
-    moment = parse_timestamp(file_timestamp) or datetime.now()
-    age = (datetime.now() - moment).total_seconds()
-
-    if age > STALE_AFTER_SECONDS:
-        # The file changed but carries an old reading - warn rather than score it.
-        await broadcast_stale()
+    missing = [field for field in REQUIRED_FIELDS if field not in reading]
+    if missing:
+        print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+              f"SKIP  /sensor response missing {missing}")
         return
+
+    # The node refreshes its snapshot once per 2 s LED phase but we poll every
+    # second, so the same reading is served twice. Processing both would double
+    # every point in the trends and every row in the CSV.
+    uptime = reading.get("uptime_ms")
+    if uptime is not None and uptime == last_seen_uptime:
+        return
+    last_seen_uptime = uptime
+
+    moment = datetime.now()
+    reading = dict(reading)
+    reading["timestamp"] = moment.isoformat(timespec="milliseconds")
 
     payload = build_payload(reading, moment)
     latest_payload = payload
-    last_reading_time = datetime.now()
+    last_reading_time = moment
     currently_stale = False
 
     append_to_csv(payload)
@@ -378,12 +475,59 @@ async def process_sensor_file():
           f"rate={payload['bleeding_rate']} mL/min hb={payload['hb_ratio']}{flag}")
 
 
+async def poll_sensor():
+    """Fetch GET /sensor once a second for as long as the server runs."""
+    if not SENSOR_URL:
+        print("HEMOGUARD_ESP32_IP is not set - no sensor node to poll.")
+        print("  set HEMOGUARD_ESP32_IP=192.168.1.45   (the IP the ESP32 prints on boot)")
+        return
+
+    print(f"Polling {SENSOR_URL} every {POLL_INTERVAL_SECONDS:g}s")
+    announced_failure = False
+
+    async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SECONDS) as client:
+        while True:
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            try:
+                response = await client.get(SENSOR_URL)
+                response.raise_for_status()
+                reading = response.json()
+            except Exception as exc:
+                # Unreachable node, timeout, or malformed body: report once per
+                # outage rather than every second.
+                if not announced_failure:
+                    print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+                          f"POLL FAILED: {type(exc).__name__}: {exc}")
+                    announced_failure = True
+                await broadcast_stale()
+                continue
+
+            if announced_failure:
+                print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+                      f"POLL RECOVERED")
+                announced_failure = False
+
+            try:
+                await handle_reading(reading)
+            except Exception as exc:  # one bad reading must not kill the poller
+                print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+                      f"ERROR processing reading: {exc}")
+
+
 async def broadcast_stale():
     """Send the last known payload flagged stale, so the dashboard keeps context."""
     global latest_payload, currently_stale
 
     if currently_stale:
         return  # already announced; don't spam clients
+
+    # A single dropped poll is not staleness. Without this the poller flips the
+    # ward badge to STALE on the first timeout, seconds after a perfectly good
+    # reading, and any brief Wi-Fi hiccup reads as a dead node.
+    if last_reading_time is not None and \
+            datetime.now() - last_reading_time <= timedelta(seconds=STALE_AFTER_SECONDS):
+        return
+
     currently_stale = True
 
     payload = dict(latest_payload)
@@ -395,7 +539,7 @@ async def broadcast_stale():
 
 
 async def staleness_monitor():
-    """A silent sensor produces no file events, so freshness needs its own heartbeat."""
+    """A node that answers with a frozen snapshot still needs to read as stale."""
     while True:
         await asyncio.sleep(STALE_CHECK_INTERVAL)
         if last_reading_time is None:
@@ -405,78 +549,26 @@ async def staleness_monitor():
 
 
 # --------------------------------------------------------------------------
-# File watcher
-# --------------------------------------------------------------------------
-
-class SensorFileHandler(FileSystemEventHandler):
-    """Runs on the watchdog thread; hands work to the asyncio loop."""
-
-    def __init__(self, loop, queue):
-        self.loop = loop
-        self.queue = queue
-
-    def _notify(self, path):
-        if Path(path).name != SENSOR_FILE.name:
-            return
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, True)
-
-    def on_modified(self, event):
-        if not event.is_directory:
-            self._notify(event.src_path)
-
-    def on_created(self, event):
-        if not event.is_directory:
-            self._notify(event.src_path)
-
-    def on_moved(self, event):
-        # serial_reader.py writes atomically, so the real signal is the rename.
-        if not event.is_directory:
-            self._notify(event.dest_path)
-
-
-async def file_event_consumer(queue):
-    while True:
-        await queue.get()
-        try:
-            await process_sensor_file()
-        except Exception as exc:  # never let one bad reading kill the consumer
-            print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
-                  f"ERROR processing reading: {exc}")
-
-
-# --------------------------------------------------------------------------
 # App lifecycle
 # --------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app):
-    loop = asyncio.get_running_loop()
-    queue = asyncio.Queue()
+    rotate_if_schema_changed()
 
-    SENSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
-    observer = Observer()
-    observer.schedule(SensorFileHandler(loop, queue), str(SENSOR_FILE.parent), recursive=False)
-    observer.start()
-
-    consumer = asyncio.create_task(file_event_consumer(queue))
+    poller = asyncio.create_task(poll_sensor())
     monitor = asyncio.create_task(staleness_monitor())
 
-    print(f"Watching {SENSOR_FILE}")
     print(f"Logging to {LOG_FILE}")
     print(f"CORS allowed origins: {', '.join(ALLOWED_ORIGINS)}")
     if not WARD_SERVER_ORIGIN and "HEMOGUARD_ALLOWED_ORIGINS" not in os.environ:
         print("CORS: no ward server origin set (HEMOGUARD_WARD_ORIGIN) - "
               "localhost only")
 
-    if SENSOR_FILE.exists():
-        await process_sensor_file()  # pick up whatever is already there
-
     yield
 
-    consumer.cancel()
+    poller.cancel()
     monitor.cancel()
-    observer.stop()
-    observer.join(timeout=5)
 
 
 app = FastAPI(title="HemoGuard", lifespan=lifespan)
@@ -512,3 +604,13 @@ async def websocket_endpoint(websocket: WebSocket):
         pass
     finally:
         await manager.disconnect(websocket)
+
+
+# --------------------------------------------------------------------------
+# Static dashboard - mounted last so it cannot shadow the API routes above.
+# --------------------------------------------------------------------------
+# Anchored to BASE_DIR rather than a bare "frontend": StaticFiles resolves a
+# relative path against the working directory, so launching uvicorn from
+# anywhere but the repo root would abort at startup with "Directory 'frontend'
+# does not exist".
+app.mount("/frontend", StaticFiles(directory=BASE_DIR / "frontend"), name="frontend")

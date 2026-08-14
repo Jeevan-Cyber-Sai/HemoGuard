@@ -1,4 +1,6 @@
-pyserial==3.5
 fastapi==0.141.1
 uvicorn[standard]==0.52.3
-watchdog==4.0.2
+httpx==0.28.1
+
+# Only needed for the retired serial flow (serial_reader.py).
+pyserial==3.5

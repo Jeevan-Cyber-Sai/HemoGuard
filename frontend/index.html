@@ -140,7 +140,7 @@
      and a watermark sitting across them costs exactly the 2-3 m readability the
      numerals exist for. */
   body.stale .card::after {
-    content: "STALE";
+    content: var(--stale-label, "STALE");
     position: absolute;
     right: 14px;
     bottom: 8px;
@@ -153,6 +153,25 @@
     transform: rotate(-8deg);
     pointer-events: none;
   }
+
+  /* ---------- not-fitted channels ----------
+     A sensor this node does not carry must not look like a sensor reading
+     zero. The card stays in place so the layout is stable when it is wired
+     in, but reads as unpopulated at a glance. */
+  .card.absent { border-color: var(--edge); }
+  .card.absent .readout { opacity: .3; }
+  .card.absent::before {
+    content: "NOT FITTED";
+    position: absolute;
+    right: 14px;
+    top: 12px;
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 2px;
+    color: var(--label);
+    opacity: .7;
+  }
+  body.stale .card.absent::before { display: none; }
 
   /* ---------- z-risk gauge ---------- */
   .gauge-card { align-items: center; }
@@ -266,6 +285,28 @@
     font-weight: 700;
   }
   .swatch { width: 13px; height: 26px; border-radius: 3px; flex: none; }
+  /* Clear-normalised colour as the sensor actually sees it - the one panel
+     where the raw counts become something a human can judge at a glance. */
+  .swatch-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .colour-chip {
+    width: 34px; height: 34px;
+    border-radius: 5px;
+    border: 1px solid var(--edge);
+    background: #000;
+    flex: none;
+    transition: background .3s;
+  }
+  .hex {
+    font-family: var(--mono);
+    font-size: clamp(14px, 1.4vw, 20px);
+    font-weight: 700;
+    color: var(--label);
+  }
   .led-badge {
     margin-top: 10px;
     text-align: center;
@@ -345,15 +386,15 @@
 
   <!-- primary vitals -->
   <div class="row">
-    <div class="card">
+    <div class="card" id="card-weight">
       <div class="label">Weight</div>
       <div class="readout"><span class="value" id="weight">--.-</span><span class="unit">g</span></div>
     </div>
-    <div class="card">
+    <div class="card" id="card-spo2">
       <div class="label">SpO&#8322;</div>
       <div class="readout"><span class="value" id="spo2">--</span><span class="unit">%</span></div>
     </div>
-    <div class="card">
+    <div class="card" id="card-pulse">
       <div class="label">Pulse Rate</div>
       <div class="readout"><span class="value" id="pulse">--</span><span class="unit">bpm</span></div>
     </div>
@@ -361,13 +402,13 @@
 
   <!-- derived metrics -->
   <div class="row">
-    <div class="card">
+    <div class="card" id="card-rate">
       <div class="label">Bleeding Rate</div>
-      <div class="readout"><span class="value mid" id="rate">0.0</span><span class="unit">mL/min</span></div>
+      <div class="readout"><span class="value mid" id="rate">&mdash;</span><span class="unit">mL/min</span></div>
     </div>
-    <div class="card">
+    <div class="card" id="card-hb">
       <div class="label">Hb Ratio</div>
-      <div class="readout"><span class="value mid" id="hb">0.00</span></div>
+      <div class="readout"><span class="value mid" id="hb">&mdash;</span></div>
     </div>
     <div class="card gauge-card">
       <div class="label" style="align-self:flex-start">Z-Risk</div>
@@ -402,6 +443,10 @@
         <div class="chan"><i class="swatch" style="background:#69f0ae"></i><span id="ch-g">---</span></div>
         <div class="chan"><i class="swatch" style="background:#448aff"></i><span id="ch-b">---</span></div>
         <div class="chan"><i class="swatch" style="background:#e0e0e0"></i><span id="ch-c">---</span></div>
+      </div>
+      <div class="swatch-row">
+        <i class="colour-chip" id="colour-chip"></i>
+        <span class="hex" id="colour-hex">#000000</span>
       </div>
       <div class="led-badge" id="led">LED --</div>
     </div>
@@ -444,8 +489,19 @@ const MAX_POINTS = 60;
 const GAUGE_CAP  = 15;          // visual clip only; the label shows the true value
 const ARC_LENGTH = Math.PI * 82; // radius 82 semicircle
 
-const COLOURS = { green: "#00c853", amber: "#ffab00", red: "#d50000" };
-const TRIAGE_TEXT = { green: "LOW", amber: "WATCH", red: "CRITICAL" };
+const COLOURS = { green: "#00c853", amber: "#ffab00", red: "#d50000",
+                  unknown: "#64748b" };
+const TRIAGE_TEXT = { green: "LOW", amber: "WATCH", red: "CRITICAL",
+                      unknown: "NO DATA" };
+
+// Statuses that mean "what is on screen is not a live measurement". The node
+// reports sensor_invalid while the backend is still replaying the last good
+// scores, and sensor_fault once it has given up on them.
+// "waiting" belongs here too: on a freshly started backend no reading has
+// arrived yet, and a LIVE badge over a dashboard that has never seen the node
+// is the exact failure this table exists to prevent.
+const DEGRADED = { stale: "STALE", offline: "OFFLINE", waiting: "WAITING",
+                   sensor_invalid: "SENSOR", sensor_fault: "SENSOR FAULT" };
 
 /* ------------------------------------------------------------------
    state
@@ -670,25 +726,45 @@ const num = (v, dp, fallback) =>
     : Number(v).toFixed(dp);
 
 function setGauge(z) {
-  const frac = Math.min(1, Math.max(0, (Number(z) || 0) / GAUGE_CAP));
+  // z_risk is null once the backend stops vouching for the held scores. An
+  // empty arc reading "—" is honest; 0.00 would read as a reassuring result.
+  const known = z !== null && z !== undefined && !Number.isNaN(Number(z));
+  const frac = known ? Math.min(1, Math.max(0, Number(z) / GAUGE_CAP)) : 0;
   $("gauge").style.strokeDasharray = ARC_LENGTH;
   $("gauge").style.strokeDashoffset = ARC_LENGTH * (1 - frac);
-  $("zrisk").textContent = num(z, 2, "0.00");   // true value, uncapped
+  $("zrisk").textContent = known ? Number(z).toFixed(2) : "—";   // uncapped
 }
 
 function render(payload) {
   if (!payload || typeof payload !== "object") return;
 
-  const stale = payload.status === "stale" || payload.status === "offline";
+  // Anything the backend does not call "live" is held or absent data, however
+  // it got that way. Rendering it under a LIVE badge is the one failure this
+  // dashboard must never have.
+  const degraded = DEGRADED[payload.status] || null;
+  const stale = degraded !== null;
   document.body.classList.toggle("stale", stale);
+  document.body.style.setProperty("--stale-label", `"${degraded || "STALE"}"`);
   $("badge").classList.toggle("stale", stale);
-  $("badge-text").textContent = stale ? "STALE" : "LIVE";
+  $("badge-text").textContent = degraded || "LIVE";
 
   if (payload.weight !== undefined) $("weight").textContent = num(payload.weight, 1, "--.-");
   if (payload.spo2 !== undefined)   $("spo2").textContent   = num(payload.spo2, 0, "--");
   if (payload.pulse !== undefined)  $("pulse").textContent  = num(payload.pulse, 0, "--");
-  if (payload.bleeding_rate !== undefined) $("rate").textContent = num(payload.bleeding_rate, 1, "0.0");
-  if (payload.hb_ratio !== undefined)      $("hb").textContent   = num(payload.hb_ratio, 2, "0.00");
+  if (payload.bleeding_rate !== undefined) $("rate").textContent = num(payload.bleeding_rate, 1, "—");
+  if (payload.hb_ratio !== undefined)      $("hb").textContent   = num(payload.hb_ratio, 2, "—");
+
+  // scored_channels lists what the node actually reported this frame, so a
+  // sensor that is not fitted reads as unpopulated rather than as a healthy
+  // zero. "rate" covers the load cell, which feeds both weight and rate.
+  if (Array.isArray(payload.scored_channels)) {
+    const has = (ch) => payload.scored_channels.includes(ch);
+    $("card-weight").classList.toggle("absent", !has("rate"));
+    $("card-rate").classList.toggle("absent", !has("rate"));
+    $("card-spo2").classList.toggle("absent", !has("spo2"));
+    $("card-pulse").classList.toggle("absent", !has("pr"));
+    $("card-hb").classList.toggle("absent", !has("hb"));
+  }
 
   if (payload.red !== undefined)   $("ch-r").textContent = `R ${payload.red}`;
   if (payload.green !== undefined) $("ch-g").textContent = `G ${payload.green}`;
@@ -703,6 +779,19 @@ function render(payload) {
     const tint = known[String(payload.led).toUpperCase()] || "#94a3b8";
     led.style.borderColor = tint;
     led.style.color = tint;
+  }
+
+  // The node sends clear-normalised 0-255 values purely so the ward can see
+  // the colour; scoring uses the raw counts above.
+  if (payload.hex) {
+    $("colour-chip").style.background = payload.hex;
+    $("colour-hex").textContent = payload.hex;
+  } else if (typeof payload.norm_r === "number") {
+    const hex = "#" + [payload.norm_r, payload.norm_g, payload.norm_b]
+      .map((v) => Math.max(0, Math.min(255, v | 0)).toString(16).padStart(2, "0"))
+      .join("").toUpperCase();
+    $("colour-chip").style.background = hex;
+    $("colour-hex").textContent = hex;
   }
 
   if (payload.z_risk !== undefined) setGauge(payload.z_risk);
