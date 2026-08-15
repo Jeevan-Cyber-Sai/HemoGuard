@@ -1,2 +1,12 @@
+[project]
+name = "hemoguard"
+version = "1.0.0"
+description = "HemoGuard FastAPI backend"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn"
+]
+
 [tool.vercel]
 entrypoint = "backend.server:app"
