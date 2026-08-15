@@ -15,6 +15,7 @@ export default function WeightPanel() {
   const [dryPad, setDryPad] = useState("");
   const [savingPad, setSavingPad] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [live, setLive] = useState(null);
 
   // Follow the node's value until the field is touched, so it always opens
   // showing what the hardware is actually subtracting.
@@ -62,6 +63,26 @@ export default function WeightPanel() {
     }
   };
 
+  // Gross is the number that proves the calibration. Net is gross minus the dry
+  // pad, so a 100 g object on a bare tray reads 83 g and looks broken when the
+  // scale is perfectly accurate.
+  const readLive = async () => {
+    setLive({ reading: true });
+    try {
+      const res = await fetch(`${API_URL}/scale`);
+      const data = await res.json();
+      if (data.status === "error") {
+        setLive(null);
+        showToast(data.message, "error");
+      } else {
+        setLive(data);
+      }
+    } catch {
+      setLive(null);
+      showToast("Could not read the scale", "error");
+    }
+  };
+
   const calibrateScale = async () => {
     try {
       const res = await fetch(`${API_URL}/weight_calibrate`, { method: "POST" });
@@ -94,12 +115,51 @@ export default function WeightPanel() {
             fontSize: 10,
             fontWeight: 700,
             letterSpacing: "0.07em",
-            color: ready ? "var(--green)" : "var(--faint)",
+            color: metrics.weightSimulated
+              ? "var(--amber)"
+              : ready
+                ? "var(--green)"
+                : "var(--faint)",
           }}
         >
-          {ready ? "LOAD CELL READY" : "NO LOAD CELL"}
+          {metrics.weightSimulated
+            ? "SIMULATED"
+            : ready
+              ? "LOAD CELL READY"
+              : "NO LOAD CELL"}
         </span>
       </div>
+
+      {/* Live tray reading. This is the one that answers "put a thing on the
+          scale and show me what it weighs" - the total below only moves when a
+          pad is deliberately banked. */}
+      {ready && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: "12px 14px",
+            borderRadius: "var(--r-sm)",
+            background: "var(--bg-deep)",
+            border: "1px solid var(--edge)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+            <span className="label">On tray now</span>
+            <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--faint)" }}>
+              live
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 4 }}>
+            <span className="numeral" style={{ fontSize: 30 }}>
+              {metrics.liveGrossG === null ? "—" : metrics.liveGrossG.toFixed(1)}
+            </span>
+            <span style={{ fontSize: 12, color: "var(--muted)" }}>g gross</span>
+            <span style={{ marginLeft: "auto", fontSize: 12, color: "var(--muted)" }}>
+              {metrics.liveNetG === null ? "—" : metrics.liveNetG.toFixed(1)} g after pad
+            </span>
+          </div>
+        </div>
+      )}
 
       <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 12 }}>
         <span className="numeral" style={{ fontSize: 36 }}>
@@ -140,6 +200,24 @@ export default function WeightPanel() {
         subtracted and the blood added to the total.
       </p>
 
+      {metrics.weightSimulated && (
+        <p
+          style={{
+            fontSize: 11.5,
+            color: "var(--amber)",
+            marginTop: 8,
+            lineHeight: 1.5,
+            padding: "8px 10px",
+            borderRadius: "var(--r-sm)",
+            background: "#fff8ec",
+            border: "1px solid #f7d9a8",
+          }}
+        >
+          Demo mode — these pad weights are generated, not measured. Unset
+          HEMOGUARD_WEIGHT_DEMO to read the real load cell.
+        </p>
+      )}
+
       {/* The scale is no longer calibrated at boot - that blocked the LED cycle
           and the colour feed when the HX711 hesitated. Started from here it can
           only ever hold up itself. */}
@@ -159,6 +237,46 @@ export default function WeightPanel() {
       >
         Calibrate scale (~16 s, follow serial prompts)
       </button>
+
+      <button
+        onClick={readLive}
+        className="press"
+        style={{
+          width: "100%",
+          marginTop: 8,
+          padding: "9px 14px",
+          borderRadius: "var(--r-sm)",
+          border: "1px solid var(--edge-strong)",
+          color: "var(--muted)",
+          fontSize: 12.5,
+          fontWeight: 600,
+        }}
+      >
+        {live?.reading ? "Reading…" : "Check scale (live, does not add to total)"}
+      </button>
+
+      {live && !live.reading && (
+        <div
+          className="pop"
+          style={{
+            marginTop: 8,
+            padding: "10px 12px",
+            borderRadius: "var(--r-sm)",
+            background: "var(--bg-deep)",
+            fontSize: 12.5,
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}
+        >
+          <Row k="Gross on tray" v={`${live.gross_g?.toFixed(2)} g`} strong />
+          <Row k={`Minus dry pad (${live.dry_pad_g?.toFixed(1)} g)`} v={`${live.net_g?.toFixed(2)} g`} />
+          <span style={{ fontSize: 11, color: "var(--faint)", marginTop: 2 }}>
+            Put a known weight on the tray — gross should match it. If it does,
+            the scale is calibrated correctly.
+          </span>
+        </div>
+      )}
 
       <div className="rule" style={{ margin: "14px 0" }} />
 
@@ -271,6 +389,17 @@ export default function WeightPanel() {
           Reset total for a new patient
         </button>
       )}
+    </div>
+  );
+}
+
+function Row({ k, v, strong }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between" }}>
+      <span style={{ color: "var(--muted)" }}>{k}</span>
+      <span style={{ fontWeight: strong ? 700 : 500, fontVariantNumeric: "tabular-nums" }}>
+        {v}
+      </span>
     </div>
   );
 }

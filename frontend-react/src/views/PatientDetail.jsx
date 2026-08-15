@@ -92,6 +92,7 @@ export default function PatientDetail() {
                 unit="mL"
                 decimals={1}
                 countUp
+                tag={metrics.weightSimulated ? "SIMULATED" : null}
                 note={
                   metrics.bloodLoss === null
                     ? metrics.scaleReady

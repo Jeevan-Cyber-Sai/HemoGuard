@@ -312,6 +312,9 @@ export function WebSocketProvider({ children }) {
       lastPadG: num(p.last_pad_g),
       dryPadG: num(p.dry_pad_g),
       scaleReady: Boolean(p.scale_ready),
+      weightSimulated: Boolean(p.weight_simulated),
+      liveGrossG: num(p.live_gross_g),
+      liveNetG: num(p.live_net_g),
 
       finger: p.finger,
       vitalsSimulated: Boolean(p.vitals_simulated),
