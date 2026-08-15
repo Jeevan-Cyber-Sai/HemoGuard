@@ -3,10 +3,24 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "Adafruit_TCS34725.h"
+#include "HX711.h"
 #include "secrets.h"
 
 #define TCS_SDA 18
 #define TCS_SCL 19
+
+// =====================================================
+// HX711 LOAD CELL
+// =====================================================
+// GPIO 4, 5 and 2 are free on this board - the colorimeter is on 18/19 and the
+// illumination LEDs on 25/26/27, so nothing collides.
+
+#define HX711_DOUT 4
+#define HX711_SCK  5
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
 
 #define RED_LED   26
 #define GREEN_LED 25
@@ -38,6 +52,46 @@ unsigned long lastColorRetryMs = 0;
 WebServer server(80);
 
 unsigned long lastWifiCheck = 0;
+
+// =====================================================
+// LOAD CELL  (weight code, merged unchanged except where noted)
+// =====================================================
+// Two deliberate departures from the original sketch, both forced:
+//
+//   1. DRY_PAD_WEIGHT was `const float`. It is set from the patient screen at
+//      runtime, and a const cannot be assigned - so it is a plain float with
+//      the same default. Nothing else about how it is used has changed.
+//
+//   2. A missing HX711 no longer halts the board. The original spun in
+//      while(true) blinking the LED; merged in here that would also kill the
+//      haemoglobin measurement, which has nothing to do with the load cell.
+//      It now records the failure and carries on.
+//
+// getWeight() is NOT called from loop(). get_units(10) averages ten HX711
+// conversions at 10 SPS, so it blocks for about a second - in the phase cycle
+// that would stall the LED rotation and corrupt the colour readings. It is
+// called only when a pad is weighed, which is what the button model wants
+// anyway.
+
+const float CALIBRATION_WEIGHT = 33.0 + 48.0;  // known weight used during step 2
+
+float DRY_PAD_WEIGHT = 17.0;   // weight of the dry pad to subtract, settable
+
+HX711 scale;
+
+float calibrationFactor = 1.0;
+float currentWeight = 0.0;
+
+bool calibrationComplete = false;
+bool haveScale = false;
+
+// Pads are weighed one at a time and their blood weights accumulate, so the
+// dashboard shows total blood recovered rather than whatever is on the tray
+// right now.
+float totalBloodWeight = 0.0;
+float lastPadWeight = 0.0;
+uint16_t padCount = 0;
+unsigned long lastPadMs = 0;
 
 uint16_t rawR = 0;
 uint16_t rawG = 0;
@@ -242,6 +296,193 @@ float concentrationFor(float absorbance)
   if (!(denom > 0.0f)) return 0.0f;
 
   return absorbance / denom;
+}
+
+// =====================================================
+// LOAD CELL ROUTINES  (verbatim from the weight sketch)
+// =====================================================
+
+long getAverageRaw(int samples)
+{
+  long total = 0;
+
+  for (int i = 0; i < samples; i++)
+  {
+    while (!scale.is_ready())
+    {
+      delay(1);
+    }
+
+    total += scale.read();
+    delay(20);
+  }
+
+  return total / samples;
+}
+
+void calibrateLoadCell()
+{
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println("HX711 CALIBRATION");
+  Serial.println("=================================");
+
+  Serial.println();
+  Serial.println("STEP 1");
+  Serial.println("Leave the empty tray on the load cell.");
+  Serial.println("Do NOT place the calibration weight yet.");
+  Serial.println("Taring in 3 seconds...");
+
+  delay(3000);
+
+  Serial.println("Taring...");
+
+  scale.tare(20);
+
+  Serial.println("Tare complete.");
+  Serial.println("Zero point established (Tray is now 0g).");
+
+  Serial.println();
+  Serial.println("STEP 2");
+  Serial.print("Place the ");
+  Serial.print(CALIBRATION_WEIGHT);
+  Serial.println(" gram calibration weight.");
+  Serial.println();
+  Serial.println("Calibration will start in 3 seconds.");
+
+  delay(3000);
+
+  Serial.println();
+  Serial.print(CALIBRATION_WEIGHT);
+  Serial.println(" g detected.");
+  Serial.println("Calibration running for 10 seconds...");
+
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  unsigned long startTime = millis();
+
+  long rawSum = 0;
+  int samples = 0;
+
+  bool ledState = false;
+  unsigned long lastBlink = millis();
+
+  while (millis() - startTime < 10000)
+  {
+    if (scale.is_ready())
+    {
+      long rawValue = scale.read();
+
+      rawSum += rawValue;
+      samples++;
+    }
+
+    if (millis() - lastBlink >= 250)
+    {
+      ledState = !ledState;
+      digitalWrite(LED_BUILTIN, ledState);
+
+      lastBlink = millis();
+    }
+
+    delay(10);
+  }
+
+  if (samples == 0)
+  {
+    Serial.println("ERROR: No HX711 readings!");
+    digitalWrite(LED_BUILTIN, LOW);
+    return;
+  }
+
+  long averageRaw = rawSum / samples;
+  long zeroRaw = scale.get_offset();
+  long rawDifference = averageRaw - zeroRaw;
+
+  if (rawDifference == 0)
+  {
+    Serial.println("ERROR: Raw difference is zero.");
+    digitalWrite(LED_BUILTIN, LOW);
+    return;
+  }
+
+  calibrationFactor = (float)rawDifference / CALIBRATION_WEIGHT;
+
+  scale.set_scale(calibrationFactor);
+
+  calibrationComplete = true;
+
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println("CALIBRATION COMPLETE");
+  Serial.println("=================================");
+
+  Serial.print("Average RAW value: ");
+  Serial.println(averageRaw);
+
+  Serial.print("Zero RAW value: ");
+  Serial.println(zeroRaw);
+
+  Serial.print("Calibration factor: ");
+  Serial.println(calibrationFactor, 6);
+
+  Serial.println();
+  Serial.println("Built-in LED is now ON.");
+  Serial.println("Remove calibration weight. Place the pad when ready.");
+  Serial.println("Starting measurement...");
+  Serial.println();
+}
+
+// Returns BLOOD weight only: gross minus the dry pad.
+float getWeight()
+{
+  if (!scale.is_ready())
+  {
+    return 0.0;
+  }
+
+  float grossWeight = scale.get_units(10);
+
+  float bloodWeight = grossWeight - DRY_PAD_WEIGHT;
+
+  if (bloodWeight < 0.5)
+  {
+    bloodWeight = 0.0;
+  }
+
+  return (bloodWeight);
+}
+
+// =====================================================
+// PAD WEIGHING
+// =====================================================
+// One press, one pad. The blood weight of each pad is added to a running total,
+// so the dashboard reports cumulative blood recovered rather than whatever
+// happens to be sitting on the tray.
+
+float weighPad()
+{
+  if (!haveScale || !calibrationComplete) return -1.0f;
+
+  currentWeight = getWeight();
+
+  totalBloodWeight += currentWeight;
+  lastPadWeight = currentWeight;
+
+  padCount++;
+  lastPadMs = millis();
+
+  Serial.print("PAD ");
+  Serial.print(padCount);
+  Serial.print(": ");
+  Serial.print(currentWeight, 2);
+  Serial.print(" g blood   total ");
+  Serial.print(totalBloodWeight, 2);
+  Serial.println(" g");
+
+  return currentWeight;
 }
 
 // =====================================================
@@ -511,7 +752,11 @@ void buildSnapshotJSON(char *out, size_t len)
     out,
     len,
     "{\"uptime_ms\":%lu"
-    ",\"weight\":null"
+    ",\"weight\":%.2f"
+    ",\"pad_count\":%u"
+    ",\"last_pad_g\":%.2f"
+    ",\"dry_pad_g\":%.2f"
+    ",\"scale_ready\":%s"
     ",\"spo2\":null"
     ",\"pulse\":null"
     ",\"red\":%u"
@@ -537,6 +782,11 @@ void buildSnapshotJSON(char *out, size_t len)
     ",\"cal_green\":%s"
     ",\"cal_ir\":%s}",
     snapUptime,
+    (double)totalBloodWeight,
+    padCount,
+    (double)lastPadWeight,
+    (double)DRY_PAD_WEIGHT,
+    (haveScale && calibrationComplete) ? "true" : "false",
     snapRawR,
     snapRawG,
     snapRawB,
@@ -635,6 +885,143 @@ void handleSensor()
     "application/json",
     json
   );
+}
+
+// =====================================================
+// WEIGH A PAD  ->  GET /weigh
+// =====================================================
+// Blocks about a second while getWeight() averages ten conversions. That is
+// acceptable here because it is a deliberate, operator-initiated action - and
+// it is exactly why the reading is not taken continuously in loop().
+
+void handleWeigh()
+{
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+
+  if (!haveScale)
+  {
+    server.send(503, "application/json",
+                "{\"status\":\"error\",\"message\":\"No load cell detected\"}");
+    return;
+  }
+
+  if (!calibrationComplete)
+  {
+    server.send(503, "application/json",
+                "{\"status\":\"error\","
+                "\"message\":\"Load cell not calibrated - reset the board\"}");
+    return;
+  }
+
+  float pad = weighPad();
+
+  char json[260];
+
+  snprintf(
+    json,
+    sizeof(json),
+    "{\"status\":\"ok\""
+    ",\"pad_g\":%.2f"
+    ",\"total_g\":%.2f"
+    ",\"pad_count\":%u"
+    ",\"dry_pad_g\":%.2f}",
+    (double)pad,
+    (double)totalBloodWeight,
+    padCount,
+    (double)DRY_PAD_WEIGHT
+  );
+
+  server.send(200, "application/json", json);
+}
+
+// =====================================================
+// DRY PAD WEIGHT  ->  GET /dry_pad?g=17.5
+// =====================================================
+// Set from the patient screen. Applies to pads weighed from now on; totals
+// already banked are not retro-adjusted, because those pads really were
+// measured against the offset in force at the time.
+
+void handleDryPad()
+{
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+
+  char json[120];
+
+  if (!server.hasArg("g"))
+  {
+    snprintf(json, sizeof(json),
+             "{\"status\":\"ok\",\"dry_pad_g\":%.2f}", (double)DRY_PAD_WEIGHT);
+    server.send(200, "application/json", json);
+    return;
+  }
+
+  float grams = server.arg("g").toFloat();
+
+  // A negative offset would add phantom blood to every pad; an absurd one would
+  // subtract all of it. Neither is a plausible dry pad.
+  if (!(grams >= 0.0f) || grams > 500.0f)
+  {
+    server.send(400, "application/json",
+                "{\"status\":\"error\","
+                "\"message\":\"Dry pad weight must be between 0 and 500 g\"}");
+    return;
+  }
+
+  DRY_PAD_WEIGHT = grams;
+
+  Serial.print("Dry pad weight set to ");
+  Serial.print(DRY_PAD_WEIGHT, 2);
+  Serial.println(" g");
+
+  snprintf(json, sizeof(json),
+           "{\"status\":\"ok\",\"dry_pad_g\":%.2f}", (double)DRY_PAD_WEIGHT);
+
+  server.send(200, "application/json", json);
+}
+
+// =====================================================
+// RESET TOTAL  ->  GET /weight_reset
+// =====================================================
+
+// =====================================================
+// CALIBRATE THE SCALE  ->  GET /weight_calibrate
+// =====================================================
+// Operator-triggered, never at boot. It blocks ~16 s and scale.tare() can wait
+// on the chip indefinitely, so running it from setup() risked killing the LED
+// cycle and the colour feed along with it. Started deliberately, the worst case
+// is that this one request hangs.
+
+void handleWeightCalibrate()
+{
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+
+  if (!haveScale)
+  {
+    server.send(503, "application/json",
+                "{\"status\":\"error\",\"message\":\"No load cell detected\"}");
+    return;
+  }
+
+  // Answer first: the sweep takes about 16 s and the caller should not be
+  // holding a socket open across it.
+  server.send(200, "application/json",
+              "{\"status\":\"started\","
+              "\"message\":\"Scale calibration started - follow the serial prompts\"}");
+
+  calibrateLoadCell();
+}
+
+void handleWeightReset()
+{
+  totalBloodWeight = 0.0;
+  lastPadWeight = 0.0;
+  padCount = 0;
+
+  Serial.println("Blood weight total reset to 0.");
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json",
+              "{\"status\":\"ok\",\"total_g\":0.00,\"pad_count\":0}");
 }
 
 void handleCalibrate()
@@ -1120,10 +1507,74 @@ void setup()
     handleCalStatus
   );
 
+  server.on(
+    "/weigh",
+    handleWeigh
+  );
+
+  server.on(
+    "/dry_pad",
+    handleDryPad
+  );
+
+  server.on(
+    "/weight_reset",
+    handleWeightReset
+  );
+
+  server.on(
+    "/weight_calibrate",
+    handleWeightCalibrate
+  );
+
   server.begin();
 
   Serial.println();
   Serial.println("Web server started.");
+
+  // ===================================================
+  // HX711 LOAD CELL
+  // ===================================================
+  // Deliberately AFTER Wi-Fi and server.begin(). The calibration routine blocks
+  // for ~16 s, and scale.tare() waits on the chip with no timeout of its own -
+  // a flaky HX711 can hang it indefinitely. Run before the network came up,
+  // that took the whole node down: no IP, no /sensor, no colour, no vitals,
+  // nothing on the dashboard at all. Now the worst case is that weight is
+  // unavailable while everything else keeps working.
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  Serial.println();
+  Serial.println("Initialising HX711...");
+
+  scale.begin(HX711_DOUT, HX711_SCK);
+
+  // Bounded wait. scale.is_ready() is a single instantaneous check that can
+  // easily fall between conversions and report a healthy chip as absent.
+  haveScale = scale.wait_ready_timeout(2000);
+
+  if (!haveScale)
+  {
+    Serial.println();
+    Serial.println("HX711 not detected - continuing without it.");
+    Serial.println("  DOUT -> GPIO 4, SCK -> GPIO 5, VCC, GND");
+    Serial.println("Weight reads as not fitted. Everything else is unaffected.");
+  }
+  else
+  {
+    Serial.println("HX711 detected!");
+    Serial.println();
+    Serial.println("Load cell NOT calibrated yet. Press CALIBRATE SCALE on the");
+    Serial.println("dashboard (or GET /weight_calibrate) when the tray is ready.");
+  }
+
+  // setup() ends here so loop() can start. The LED phase cycle, the colour
+  // readings and /sensor all live in loop(), so anything that blocks setup
+  // blocks ALL of them - which is exactly what running the load-cell
+  // calibration here did. scale.tare() waits on the chip with no timeout of
+  // its own, so one hesitant HX711 left the LEDs dark and the node silent.
+  // Calibration is now operator-triggered, after the board is already alive.
 
   Serial.println();
   Serial.println("Open the IP address above");

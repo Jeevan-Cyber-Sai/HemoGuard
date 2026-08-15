@@ -309,10 +309,27 @@ export default function App() {
         <Card label="Weight" accent={accent} absent={absent("rate")} flashKey={p.weight}>
           {!absent("rate") && <Readout value={num(p.weight, 1)} unit="g" />}
         </Card>
-        <Card label="SpO₂" accent={accent} absent={absent("spo2")} flashKey={p.spo2}>
+        {/* A node running in demo mode emits a plausible random walk for
+            SpO2 and pulse. Those are exactly the values that look measured and
+            are not, so they are labelled wherever they appear. */}
+        <Card
+          label="SpO₂"
+          accent={accent}
+          absent={absent("spo2")}
+          absentLabel={p.finger === false ? "NO FINGER" : "NOT FITTED"}
+          tag={p.vitals_simulated ? "SIMULATED" : null}
+          flashKey={p.spo2}
+        >
           {!absent("spo2") && <Readout value={num(p.spo2, 0)} unit="%" />}
         </Card>
-        <Card label="Pulse Rate" accent={accent} absent={absent("pr")} flashKey={p.pulse}>
+        <Card
+          label="Pulse Rate"
+          accent={accent}
+          absent={absent("pr")}
+          absentLabel={p.finger === false ? "NO FINGER" : "NOT FITTED"}
+          tag={p.vitals_simulated ? "SIMULATED" : null}
+          flashKey={p.pulse}
+        >
           {!absent("pr") && (
             <>
               <Readout value={num(p.pulse, 0)} unit="bpm" />

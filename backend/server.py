@@ -37,9 +37,39 @@ ESP32_IP = os.environ.get("HEMOGUARD_ESP32_IP", "").strip()
 SENSOR_URL = f"http://{ESP32_IP}/sensor" if ESP32_IP else ""
 CALIBRATE_URL = f"http://{ESP32_IP}/calibrate" if ESP32_IP else ""
 CAL_STATUS_URL = f"http://{ESP32_IP}/cal_status" if ESP32_IP else ""
+WEIGH_URL = f"http://{ESP32_IP}/weigh" if ESP32_IP else ""
+DRY_PAD_URL = f"http://{ESP32_IP}/dry_pad" if ESP32_IP else ""
+WEIGHT_RESET_URL = f"http://{ESP32_IP}/weight_reset" if ESP32_IP else ""
+WEIGHT_CAL_URL = f"http://{ESP32_IP}/weight_calibrate" if ESP32_IP else ""
+
+# Weighing a pad averages ten HX711 conversions at 10 SPS, so the node blocks
+# for about a second before it answers.
+WEIGH_TIMEOUT_SECONDS = 8.0
+
+# Optional second node: the ESP8266 carrying the MAX30102 pulse oximeter. It is
+# a separate board on its own IP, so it gets its own poller and its readings are
+# merged into the colour node's frame before scoring.
+#
+#     set HEMOGUARD_VITALS_IP=192.168.43.52
+#
+# Unset, the SpO2 and pulse channels simply stay unfitted, exactly as now.
+VITALS_IP = os.environ.get("HEMOGUARD_VITALS_IP", "").strip()
+VITALS_URL = f"http://{VITALS_IP}/data" if VITALS_IP else ""
 
 POLL_INTERVAL_SECONDS = 1.0
 POLL_TIMEOUT_SECONDS = 2.0   # must stay below the interval budget
+
+# Vitals older than this are dropped rather than merged. The oximeter is on a
+# different board from the colorimeter, so it can die on its own - and a frozen
+# pulse silently riding along on a live colour frame is indistinguishable from a
+# real one.
+VITALS_MAX_AGE_SECONDS = 6.0
+
+# How long the colour node must be silent before the vitals node starts
+# publishing frames on its own. The two boards are independent, so one being
+# absent must not blank the other - but while both are feeding, only the colour
+# frames are broadcast, or every reading would go out twice.
+COLOUR_QUIET_SECONDS = 3.0
 
 # The node blocks for a 10 s sweep before it answers /calibrate, so the ceiling
 # has to clear that with room for the round trip.
@@ -81,6 +111,9 @@ _DEFAULT_ORIGINS = [
     "http://localhost:8000",
     "http://127.0.0.1",
     "http://127.0.0.1:8000",
+    # Vite dev server for frontend-react/
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ]
 
 _configured = os.environ.get("HEMOGUARD_ALLOWED_ORIGINS", "").strip()
@@ -94,6 +127,11 @@ else:
 STALE_AFTER_SECONDS = 10
 STALE_CHECK_INTERVAL = 2  # how often the heartbeat re-checks freshness
 ROLLING_WINDOW = 5        # weight readings used for the bleeding-rate slope
+
+# How long a pad-interval rate stays meaningful. Pads are weighed minutes apart,
+# so the figure has to survive between them - but not forever, or a rate from an
+# hour ago would still be presented as current.
+PAD_RATE_MAX_AGE_SECONDS = 1800.0
 
 # 1 g of blood ~ 1 mL. Kept explicit so it can be tuned to 1.06 g/mL if needed.
 GRAMS_PER_ML = 1.0
@@ -245,7 +283,7 @@ RED_PHASE_LED = "RED"
 
 CSV_COLUMNS = [
     "timestamp", "weight_g", "spo2", "pulse_bpm", "red", "green", "blue",
-    "clear", "led", "bleeding_rate", "hb_index", "hb_mode", "hb_g_dl", "blood_ml", "hb_mass_mg", "z_hb", "z_risk",
+    "clear", "led", "bleeding_rate", "hb_index", "hb_mode", "hb_g_dl", "blood_ml", "hb_mass_mg", "vitals_simulated", "z_hb", "z_risk",
     "triage", "valid",
     "scored_channels",
     # Beer-Lambert. conc_* are numerically identical to the absorbances by
@@ -270,6 +308,8 @@ PASSTHROUGH_FIELDS = (
     "norm_r", "norm_g", "norm_b", "hex",
     "calibrated", "absorbance", "concentration",
     "cal_red", "cal_green", "cal_ir",
+    "pad_count", "last_pad_g", "dry_pad_g", "scale_ready",
+    "finger", "vitals_ir", "vitals_simulated",
     "abs_red", "abs_green", "abs_ir",
     "conc_red", "conc_green", "conc_ir",
 )
@@ -286,6 +326,9 @@ class RiskEngine:
         self.weight_window = deque(maxlen=ROLLING_WINDOW)  # (seconds, grams)
         self.consecutive_critical = 0
         self.last_hb = None          # (value, mode) of the last usable hb index
+        self.last_pad_count = -1     # pad weighings seen, for the interval rate
+        self.last_pad_at = None
+        self.pad_rate_value = None
         self.phases_seen = set()     # LEDs actually lit since the last baseline
         self.calibrated_seen = False # so a new baseline can reset the above
         self.last_scored = None      # carried forward when a reading is invalid
@@ -324,6 +367,51 @@ class RiskEngine:
         ml_per_minute = (grams_per_second * 60.0) / GRAMS_PER_ML
         return max(0.0, ml_per_minute)
 
+    def pad_rate(self, reading, moment):
+        """mL/min from discrete pad weighings, or None when it cannot be known.
+
+        The first pad has no preceding interval to divide by, so it yields no
+        rate at all rather than a guess. After that the figure holds until the
+        next pad - it is the best available estimate - but only up to
+        PAD_RATE_MAX_AGE_SECONDS. Past that nobody has weighed anything for a
+        long time and the old number has stopped describing the present, which
+        is exactly the latched-reading failure this system keeps having to
+        avoid.
+        """
+        count = self._as_float(reading.get("pad_count"))
+        if count is None:
+            return None
+        count = int(count)
+
+        if count < self.last_pad_count:
+            # The counter went backwards, which only happens when the total is
+            # reset for a new patient. Everything the old rate described belongs
+            # to the previous one, so it is discarded rather than carried over.
+            self.last_pad_count = count
+            self.last_pad_at = None
+            self.pad_rate_value = None
+            return None
+
+        if count != self.last_pad_count:
+            # A rate needs TWO pads: the blood in this one, over the time since
+            # the previous one was weighed. On the very first pad the only
+            # elapsed time available is however long the backend happened to
+            # have been running, which is not a collection interval at all - it
+            # produced a spurious 295 mL/min from a 25 g pad.
+            if self.last_pad_at is not None and self.last_pad_count >= 1:
+                elapsed_min = (moment - self.last_pad_at).total_seconds() / 60.0
+                grams = self._as_float(reading.get("last_pad_g")) or 0.0
+                if elapsed_min > 0:
+                    self.pad_rate_value = (grams / elapsed_min) / GRAMS_PER_ML
+            self.last_pad_count = count
+            self.last_pad_at = moment
+
+        if self.last_pad_at is None:
+            return None
+        if (moment - self.last_pad_at).total_seconds() > PAD_RATE_MAX_AGE_SECONDS:
+            return None
+        return self.pad_rate_value
+
     def hb_index(self, reading):
         """Haemoglobin index from the raw sensor counts. Returns (value, mode).
 
@@ -356,6 +444,16 @@ class RiskEngine:
         was read under the red LED where blood and a red plastic card differ by
         about 2%.
         """
+        # A frame with no LED carries no optical data at all - that is a
+        # vitals-only frame, published while the colour node is absent. Holding
+        # the last haemoglobin reading across it would keep scoring a sample
+        # nothing is currently looking at, which is the same latched-data
+        # failure the triage band already guards against.
+        if reading.get("led") is None:
+            self.last_hb = None
+            self.phases_seen.clear()
+            return None, None
+
         calibrated = bool(reading.get("calibrated"))
         led = str(reading.get("led", "")).upper()
 
@@ -443,7 +541,22 @@ class RiskEngine:
         # placeholder would fabricate a slope out of nothing, and clearing the
         # window would discard history a load cell may still be feeding.
         weight = self._optional(reading, "weight", zero_is_absent=False)
-        rate = self.bleeding_rate(weight, moment) if weight is not None else None
+
+        # Two different weight sources need two different rate calculations.
+        #
+        # A drape sitting on the cell rises continuously, so a least-squares
+        # slope over the rolling window is the rate. Pads weighed one at a time
+        # give a CUMULATIVE total that is flat and then steps - a slope across
+        # that step reports the whole pad as if it were shed in five seconds,
+        # which would alarm on every weighing.
+        #
+        # For pads the honest figure is the pad's blood divided by the interval
+        # since the previous pad: the true average rate over the period that pad
+        # was collecting.
+        if reading.get("pad_count") is not None:
+            rate = self.pad_rate(reading, moment)
+        else:
+            rate = self.bleeding_rate(weight, moment) if weight is not None else None
 
         # The absorbance form is available on every frame - the node holds all
         # three phase absorbances and refreshes whichever LED is lit - so the
@@ -623,6 +736,7 @@ def append_to_csv(payload):
             payload.get("hb_g_dl"),
             payload.get("blood_ml"),
             payload.get("hb_mass_mg"),
+            payload.get("vitals_simulated"),
             payload.get("z_hb"),
             payload.get("z_risk"),
             payload.get("triage"),
@@ -687,6 +801,17 @@ last_seen_uptime = None    # device uptime_ms of the last reading we processed
 currently_stale = False
 consecutive_invalid = 0    # runs of readings the node flagged valid:false
 
+# Last frame from the oximeter node, with the wall-clock time it arrived so a
+# dead board's numbers can be aged out rather than merged forever.
+latest_vitals = None
+latest_vitals_at = None
+
+# When the COLOUR node last produced a reading, kept apart from
+# last_reading_time (which covers any broadcast, from either board). Without the
+# distinction, a vitals-only frame would refresh the same clock it is tested
+# against and the vitals node would immediately stop publishing.
+last_colour_at = None
+
 # The node blocks inside its 10 s calibration sweep and cannot serve /sensor
 # while it runs, so every poll in that window times out. Without this flag the
 # dashboard would flash STALE in the middle of a calibration the operator just
@@ -749,6 +874,7 @@ def build_payload(reading, moment):
 async def handle_reading(reading):
     """Score one reading from the node, log it, broadcast it."""
     global latest_payload, last_reading_time, last_seen_uptime, currently_stale
+    global last_colour_at
 
     if not isinstance(reading, dict):
         return
@@ -768,7 +894,63 @@ async def handle_reading(reading):
     last_seen_uptime = uptime
 
     moment = datetime.now()
+    reading = merge_vitals(reading)
     reading = dict(reading)
+    reading["timestamp"] = moment.isoformat(timespec="milliseconds")
+
+    payload = build_payload(reading, moment)
+    latest_payload = payload
+    last_reading_time = moment
+    last_colour_at = moment
+    currently_stale = False
+
+    append_to_csv(payload)
+    await manager.broadcast(payload)
+    flag = "" if payload["valid"] else "  SENSOR_INVALID (scores held)"
+    print(f"[{payload['timestamp']}] z_risk={payload['z_risk']} triage={payload['triage']} "
+          f"rate={payload['bleeding_rate']} mL/min "
+          f"hb={payload['hb_index']} ({payload['hb_mode']}){flag}")
+
+
+def merge_vitals(reading):
+    """Fold the oximeter node's numbers into the colour node's frame.
+
+    Absent, invalid and stale all resolve to None rather than 0. The scoring
+    engine reads 0 as a failure sentinel anyway, but None states the case
+    plainly and keeps the two boards' failure modes separate: the colorimeter
+    going quiet must not blank the pulse, and vice versa.
+    """
+    if latest_vitals is None or latest_vitals_at is None:
+        return reading
+
+    age = (datetime.now() - latest_vitals_at).total_seconds()
+    if age > VITALS_MAX_AGE_SECONDS:
+        return reading
+
+    reading = dict(reading)
+    reading["pulse"] = latest_vitals.get("pulse")
+    reading["spo2"] = latest_vitals.get("spo2")
+    reading["finger"] = latest_vitals.get("finger")
+    reading["vitals_ir"] = latest_vitals.get("ir")
+
+    # Carried through so the dashboard can label simulated numbers as such.
+    # A demo-mode oximeter emits a plausible random walk, which is exactly the
+    # kind of value that looks measured and is not.
+    reading["vitals_simulated"] = latest_vitals.get("simulated", False)
+    return reading
+
+
+async def publish_vitals_only():
+    """Broadcast a frame built from the oximeter alone.
+
+    Used when the colour node is absent. The optical fields are left out
+    entirely rather than zeroed, so the engine scores only what is actually
+    being measured and the dashboard marks haemoglobin as unfitted.
+    """
+    global latest_payload, last_reading_time, currently_stale
+
+    moment = datetime.now()
+    reading = merge_vitals({"weight": None, "valid": True})
     reading["timestamp"] = moment.isoformat(timespec="milliseconds")
 
     payload = build_payload(reading, moment)
@@ -778,10 +960,83 @@ async def handle_reading(reading):
 
     append_to_csv(payload)
     await manager.broadcast(payload)
-    flag = "" if payload["valid"] else "  SENSOR_INVALID (scores held)"
-    print(f"[{payload['timestamp']}] z_risk={payload['z_risk']} triage={payload['triage']} "
-          f"rate={payload['bleeding_rate']} mL/min "
-          f"hb={payload['hb_index']} ({payload['hb_mode']}){flag}")
+
+
+async def poll_vitals():
+    """Fetch the oximeter node's GET /data once a second."""
+    global latest_vitals, latest_vitals_at
+
+    if not VITALS_URL:
+        print("HEMOGUARD_VITALS_IP is not set - SpO2 and pulse stay unfitted.")
+        return
+
+    print(f"Polling vitals {VITALS_URL} every {POLL_INTERVAL_SECONDS:g}s")
+    announced_failure = False
+    warned_simulated = False
+
+    limits = httpx.Limits(max_keepalive_connections=0)
+    async with httpx.AsyncClient(timeout=POLL_TIMEOUT_SECONDS, limits=limits,
+                                 headers={"Connection": "close"}) as client:
+        while True:
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            try:
+                response = await client.get(VITALS_URL)
+                response.raise_for_status()
+                data = response.json()
+            except Exception as exc:
+                if not announced_failure:
+                    print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+                          f"VITALS POLL FAILED: {type(exc).__name__}: {exc}")
+                    announced_failure = True
+                continue
+
+            if announced_failure:
+                print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+                      f"VITALS POLL RECOVERED")
+                announced_failure = False
+
+            if not isinstance(data, dict):
+                continue
+
+            # A reading only counts when a finger is present AND the node
+            # flagged it valid. Without the finger the oximeter still returns
+            # numbers; they just describe the tabletop.
+            finger = bool(data.get("fingerDetected"))
+            usable = finger and not data.get("isCalibrating")
+
+            pulse = data.get("hr") if (usable and data.get("hr_valid")) else None
+            spo2 = data.get("spo2") if (usable and data.get("spo2_valid")) else None
+
+            simulated = bool(data.get("demoMode"))
+            if simulated and not warned_simulated:
+                print("VITALS: node reports demoMode - SpO2 and pulse are "
+                      "SIMULATED, not measured. Flagged as such on the "
+                      "dashboard.")
+                warned_simulated = True
+
+            latest_vitals = {
+                "pulse": pulse,
+                "spo2": spo2,
+                "ir": data.get("ir"),
+                "finger": finger,
+                "simulated": simulated,
+            }
+            latest_vitals_at = datetime.now()
+
+            # Drive the dashboard alone while the colour node is quiet. When it
+            # is feeding, its frames already carry these vitals merged in, and
+            # publishing here as well would double every point in the trends.
+            colour_quiet = (
+                last_colour_at is None
+                or (datetime.now() - last_colour_at).total_seconds()
+                > COLOUR_QUIET_SECONDS
+            )
+            if colour_quiet:
+                try:
+                    await publish_vitals_only()
+                except Exception as exc:
+                    print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+                          f"ERROR publishing vitals-only frame: {exc}")
 
 
 async def poll_sensor():
@@ -847,6 +1102,12 @@ async def broadcast_stale():
     if calibrating:
         return  # the node is busy by request, not unreachable
 
+    # The oximeter is a separate board. While it is feeding, the dashboard is
+    # live - the colour node being down shows up as haemoglobin going unfitted,
+    # not as the whole feed going stale.
+    if latest_vitals_at is not None and             (datetime.now() - latest_vitals_at).total_seconds() <= VITALS_MAX_AGE_SECONDS:
+        return
+
     # A single dropped poll is not staleness. Without this the poller flips the
     # ward badge to STALE on the first timeout, seconds after a perfectly good
     # reading, and any brief Wi-Fi hiccup reads as a dead node.
@@ -884,6 +1145,7 @@ async def lifespan(app):
     load_saved_calibration()
 
     poller = asyncio.create_task(poll_sensor())
+    vitals = asyncio.create_task(poll_vitals())
     monitor = asyncio.create_task(staleness_monitor())
 
     print(f"Logging to {LOG_FILE}")
@@ -900,6 +1162,7 @@ async def lifespan(app):
     yield
 
     poller.cancel()
+    vitals.cancel()
     monitor.cancel()
 
 
@@ -1127,6 +1390,114 @@ async def clear_reference():
     return {"status": "cleared"}
 
 
+async def _node_get(url, timeout, params=None):
+    """One short request to the node, with the pooling turned off."""
+    limits = httpx.Limits(max_keepalive_connections=0)
+    async with httpx.AsyncClient(timeout=timeout, limits=limits,
+                                 headers={"Connection": "close"}) as client:
+        response = await client.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+
+
+@app.post("/weigh")
+async def weigh():
+    """Weigh the pad currently on the tray and add its blood to the total."""
+    if not WEIGH_URL:
+        return {"status": "error",
+                "message": "HEMOGUARD_ESP32_IP is not set - no load cell to read."}
+    try:
+        result = await _node_get(WEIGH_URL, WEIGH_TIMEOUT_SECONDS)
+    except Exception as exc:
+        detail = describe_node_failure(exc, WEIGH_URL)
+        print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+              f"WEIGH FAILED: {type(exc).__name__}: {exc}")
+        await manager.broadcast({"type": "weigh", "status": "error",
+                                 "message": detail})
+        return {"status": "error", "message": detail}
+
+    pad = result.get("pad_g")
+    total = result.get("total_g")
+    print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+          f"PAD {result.get('pad_count')}: {pad} g blood, total {total} g")
+
+    message = (f"Pad {result.get('pad_count')}: {pad:.2f} g blood · "
+               f"total {total:.2f} g") if isinstance(pad, (int, float)) else \
+              "Pad weighed"
+    await manager.broadcast({"type": "weigh", "status": "complete",
+                             "message": message, "result": result})
+    return result
+
+
+@app.post("/dry_pad")
+async def set_dry_pad(body: dict):
+    """Set the dry-pad offset subtracted from every future pad."""
+    try:
+        grams = float(body.get("g"))
+    except (TypeError, ValueError):
+        return {"status": "error", "message": "Send a numeric g value."}
+
+    # Mirrors the node's own guard so a bad figure is refused before it reaches
+    # the hardware: a negative offset would add phantom blood to every pad.
+    if not (0.0 <= grams <= 500.0):
+        return {"status": "error",
+                "message": "Dry pad weight must be between 0 and 500 g."}
+
+    if not DRY_PAD_URL:
+        return {"status": "error",
+                "message": "HEMOGUARD_ESP32_IP is not set - no load cell."}
+    try:
+        result = await _node_get(DRY_PAD_URL, POLL_TIMEOUT_SECONDS,
+                                 params={"g": f"{grams:.2f}"})
+    except Exception as exc:
+        detail = describe_node_failure(exc, DRY_PAD_URL)
+        return {"status": "error", "message": detail}
+
+    await manager.broadcast({"type": "weigh", "status": "complete",
+                             "message": f"Dry pad weight set to {grams:g} g",
+                             "result": result})
+    return result
+
+
+@app.post("/weight_reset")
+async def weight_reset():
+    """Clear the accumulated blood total, e.g. between patients."""
+    if not WEIGHT_RESET_URL:
+        return {"status": "error",
+                "message": "HEMOGUARD_ESP32_IP is not set - no load cell."}
+    try:
+        result = await _node_get(WEIGHT_RESET_URL, POLL_TIMEOUT_SECONDS)
+    except Exception as exc:
+        return {"status": "error",
+                "message": describe_node_failure(exc, WEIGHT_RESET_URL)}
+
+    await manager.broadcast({"type": "weigh", "status": "complete",
+                             "message": "Blood total reset to 0 g",
+                             "result": result})
+    return result
+
+
+@app.post("/weight_calibrate")
+async def weight_calibrate():
+    """Start the load-cell calibration. The node answers immediately and then
+    runs the ~16 s routine, prompting on its serial monitor."""
+    if not WEIGHT_CAL_URL:
+        return {"status": "error",
+                "message": "HEMOGUARD_ESP32_IP is not set - no load cell."}
+    try:
+        result = await _node_get(WEIGHT_CAL_URL, POLL_TIMEOUT_SECONDS)
+    except Exception as exc:
+        return {"status": "error",
+                "message": describe_node_failure(exc, WEIGHT_CAL_URL)}
+
+    await manager.broadcast({
+        "type": "weigh", "status": "complete",
+        "message": "Scale calibration started - follow the serial prompts (~16 s)",
+        "result": result,
+    })
+    return result
+
+
 @app.get("/diag")
 async def diag():
     """One call that says which link in the chain is broken.
@@ -1136,44 +1507,85 @@ async def diag():
     error string wastes far more time than asking the node directly.
     """
     report = {
-        "esp32_ip": ESP32_IP or None,
-        "sensor_url": SENSOR_URL or None,
+        "colour_node_ip": ESP32_IP or None,
+        "vitals_node_ip": VITALS_IP or None,
         "last_reading": last_reading_time.isoformat() if last_reading_time else None,
+        "last_vitals": latest_vitals_at.isoformat() if latest_vitals_at else None,
         "checks": [],
+        "verdict": [],
     }
 
-    if not ESP32_IP:
-        report["verdict"] = ("HEMOGUARD_ESP32_IP is not set in the window "
-                             "running uvicorn. Set it and restart.")
-        return report
+    targets = []
+    if ESP32_IP:
+        targets += [("colour", "sensor", SENSOR_URL),
+                    ("colour", "cal_status", CAL_STATUS_URL)]
+    if VITALS_IP:
+        targets += [("vitals", "data", VITALS_URL)]
 
     limits = httpx.Limits(max_keepalive_connections=0)
     async with httpx.AsyncClient(timeout=3.0, limits=limits,
                                  headers={"Connection": "close"}) as client:
-        for name, url in (("sensor", SENSOR_URL), ("cal_status", CAL_STATUS_URL)):
+        for node, name, url in targets:
+            entry = {"node": node, "endpoint": name, "url": url}
             try:
                 response = await client.get(url)
-                report["checks"].append({
-                    "endpoint": name, "url": url, "ok": response.is_success,
-                    "http_status": response.status_code,
-                })
+                entry["ok"] = response.is_success
+                entry["http_status"] = response.status_code
+                # The vitals node advertises whether its numbers are measured.
+                if node == "vitals" and response.is_success:
+                    body = response.json()
+                    entry["demo_mode"] = bool(body.get("demoMode"))
+                    entry["finger"] = bool(body.get("fingerDetected"))
             except Exception as exc:
-                report["checks"].append({
-                    "endpoint": name, "url": url, "ok": False,
-                    "error": type(exc).__name__, "detail": str(exc),
-                })
+                entry["ok"] = False
+                entry["error"] = type(exc).__name__
+                entry["detail"] = str(exc)
+            report["checks"].append(entry)
 
-    reachable = [c for c in report["checks"] if c.get("ok")]
-    if not reachable:
-        report["verdict"] = (
-            "The node is not reachable from this PC at all. Either the IP is "
-            "stale (check the ESP32 serial monitor) or the network blocks "
-            "device-to-device traffic - try a 2.4GHz phone hotspot.")
-    elif len(reachable) < len(report["checks"]):
-        report["verdict"] = ("The node answers but not on every endpoint - it is "
-                             "likely running older firmware. Re-flash.")
-    else:
-        report["verdict"] = "Node reachable on all endpoints. Calibration should work."
+    def verdict_for(node, label, env_name):
+        rows = [c for c in report["checks"] if c["node"] == node]
+        if not rows:
+            report["verdict"].append(
+                f"{label}: {env_name} is not set in the window running uvicorn, "
+                f"so this node is not being polled at all.")
+            return
+        if not any(r.get("ok") for r in rows):
+            report["verdict"].append(
+                f"{label}: not reachable at all. The IP is stale, the board is "
+                f"off, or it is on a DIFFERENT Wi-Fi network from this PC.")
+        elif not all(r.get("ok") for r in rows):
+            report["verdict"].append(
+                f"{label}: answers on some endpoints only - likely older "
+                f"firmware. Re-flash it.")
+        else:
+            report["verdict"].append(f"{label}: reachable, all endpoints OK.")
+
+    verdict_for("colour", "Colour node (haemoglobin)", "HEMOGUARD_ESP32_IP")
+    verdict_for("vitals", "Vitals node (SpO2/pulse)", "HEMOGUARD_VITALS_IP")
+
+    # Both boards have to sit on the same network as this PC. Two nodes on
+    # different SSIDs is the single most common cause of "one works, one does
+    # not", and comparing their subnets catches it immediately.
+    def subnet(ip):
+        host = (ip or "").split(":")[0]
+        parts = host.split(".")
+        return ".".join(parts[:3]) if len(parts) == 4 else None
+
+    a, b = subnet(ESP32_IP), subnet(VITALS_IP)
+    if a and b and a != b:
+        report["verdict"].append(
+            f"WARNING: the two nodes are on different subnets ({a}.x and "
+            f"{b}.x). They are almost certainly joined to different Wi-Fi "
+            f"networks - check the SSID in each board's sketch.")
+
+    vitals_demo = [c for c in report["checks"]
+                   if c["node"] == "vitals" and c.get("demo_mode")]
+    if vitals_demo:
+        report["verdict"].append(
+            "NOTE: the vitals node reports demoMode - its SpO2 and pulse are "
+            "simulated random values, not measurements. Flash "
+            "firmware/hemoguard_vitals to measure them.")
+
     return report
 
 

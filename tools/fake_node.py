@@ -75,6 +75,14 @@ _cal_end = 0.0
 _baseline = None
 NO_IR = False
 
+# Load cell state, mirroring the firmware: pads are weighed on demand and their
+# blood weights accumulate.
+_dry_pad_g = 17.0
+_total_g = 0.0
+_last_pad_g = 0.0
+_pad_count = 0
+_pad_seq = 0
+
 # Last computed absorbance / concentration per phase, mirroring the firmware's
 # behaviour of holding the other two while one LED is lit.
 _abs_phase = [0.0, 0.0, 0.0]
@@ -111,6 +119,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._calibrate()
         if self.path == "/cal_status":
             return self._cal_status()
+        if self.path == "/weigh":
+            return self._weigh()
+        if self.path.startswith("/dry_pad"):
+            return self._dry_pad()
+        if self.path == "/weight_reset":
+            return self._weight_reset()
         self.send_response(404)
         self.end_headers()
 
@@ -135,7 +149,12 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json(200, {
             "uptime_ms": phase * 2000,
-            "weight": None, "spo2": None, "pulse": None,
+            "weight": _total_g if _pad_count else None,
+            "pad_count": _pad_count,
+            "last_pad_g": _last_pad_g,
+            "dry_pad_g": _dry_pad_g,
+            "scale_ready": True,
+            "spo2": None, "pulse": None,
             "red": r, "green": g, "blue": b, "clear": c,
             "norm_r": nr, "norm_g": ng, "norm_b": nb,
             "hex": "#%02X%02X%02X" % (nr, ng, nb),
@@ -204,6 +223,49 @@ class Handler(BaseHTTPRequestHandler):
                 "baseline": _baseline,
                 "uptime_ms": int((time.time() - START) * 1000),
             })
+
+    def _weigh(self):
+        """Each press yields a plausible soaked pad, as the HX711 would."""
+        global _total_g, _last_pad_g, _pad_count, _pad_seq
+        with _lock:
+            _pad_seq += 1
+            gross = [42.0, 61.5, 28.0, 74.2, 35.8][(_pad_seq - 1) % 5]
+            blood = max(0.0, gross - _dry_pad_g)
+            _last_pad_g = round(blood, 2)
+            _total_g = round(_total_g + blood, 2)
+            _pad_count += 1
+            print(f"  pad {_pad_count}: {_last_pad_g} g blood, total {_total_g} g")
+            self._json(200, {"status": "ok", "pad_g": _last_pad_g,
+                             "total_g": _total_g, "pad_count": _pad_count,
+                             "dry_pad_g": _dry_pad_g})
+
+    def _dry_pad(self):
+        global _dry_pad_g
+        from urllib.parse import urlparse, parse_qs
+        args = parse_qs(urlparse(self.path).query)
+        if "g" in args:
+            try:
+                g = float(args["g"][0])
+            except ValueError:
+                self._json(400, {"status": "error", "message": "bad g"})
+                return
+            if not (0.0 <= g <= 500.0):
+                self._json(400, {"status": "error",
+                                 "message": "Dry pad weight must be 0-500 g"})
+                return
+            with _lock:
+                _dry_pad_g = g
+            print(f"  dry pad set to {g} g")
+        self._json(200, {"status": "ok", "dry_pad_g": _dry_pad_g})
+
+    def _weight_reset(self):
+        global _total_g, _last_pad_g, _pad_count
+        with _lock:
+            _total_g = 0.0
+            _last_pad_g = 0.0
+            _pad_count = 0
+        print("  weight total reset")
+        self._json(200, {"status": "ok", "total_g": 0.0, "pad_count": 0})
 
     def log_message(self, *args):
         pass   # one line per second per client is pure noise

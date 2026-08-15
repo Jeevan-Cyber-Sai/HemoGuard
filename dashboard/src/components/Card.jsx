@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
  * actually changed.
  */
 export function Card({ label, accent, absent, absentLabel = "NOT FITTED",
+                       tag, tagColor = "#ffab00",
                        flashKey, className = "", children }) {
   const [flash, setFlash] = useState(0);
   const prev = useRef(flashKey);
@@ -51,6 +52,22 @@ export function Card({ label, accent, absent, absentLabel = "NOT FITTED",
           style={{ fontSize: "calc(var(--v-label) * 0.92)" }}
         >
           {absentLabel}
+        </div>
+      )}
+
+      {/* Provenance warning - a value that is present but not measured. It sits
+          where NOT FITTED would, because it answers the same question: how much
+          should you trust the number under it. */}
+      {!absent && tag && (
+        <div
+          className="absolute right-3 top-2 rounded border px-1.5 py-0.5 font-mono tracking-[0.14em]"
+          style={{
+            fontSize: "calc(var(--v-label) * 0.9)",
+            borderColor: tagColor,
+            color: tagColor,
+          }}
+        >
+          {tag}
         </div>
       )}
 
