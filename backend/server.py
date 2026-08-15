@@ -12,7 +12,9 @@ Run with:
 import asyncio
 import csv
 import json
+import math
 import os
+import random
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -41,10 +43,38 @@ WEIGH_URL = f"http://{ESP32_IP}/weigh" if ESP32_IP else ""
 DRY_PAD_URL = f"http://{ESP32_IP}/dry_pad" if ESP32_IP else ""
 WEIGHT_RESET_URL = f"http://{ESP32_IP}/weight_reset" if ESP32_IP else ""
 WEIGHT_CAL_URL = f"http://{ESP32_IP}/weight_calibrate" if ESP32_IP else ""
+SCALE_URL = f"http://{ESP32_IP}/scale" if ESP32_IP else ""
 
 # Weighing a pad averages ten HX711 conversions at 10 SPS, so the node blocks
 # for about a second before it answers.
 WEIGH_TIMEOUT_SECONDS = 8.0
+
+# Demo weighing, for showing the system when the load cell is not usable.
+#
+#     set HEMOGUARD_WEIGHT_DEMO=1
+#
+# Each press produces a plausible soaked pad instead of reading the HX711. The
+# figures are flagged weight_simulated so the dashboard marks them SIMULATED -
+# an unlabelled invented number on a blood-loss card is indistinguishable from a
+# measurement, and this is the one screen where that must never happen.
+WEIGHT_DEMO = os.environ.get("HEMOGUARD_WEIGHT_DEMO", "").strip() not in ("", "0")
+
+# Gross weight range a demo pad lands in, before the dry pad is subtracted.
+# Read directly rather than through _threshold(), which is not defined yet here.
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+WEIGHT_DEMO_MIN_G = _env_float("HEMOGUARD_WEIGHT_DEMO_MIN_G", 80.0)
+WEIGHT_DEMO_MAX_G = _env_float("HEMOGUARD_WEIGHT_DEMO_MAX_G", 100.0)
+
+# Continuous seepage between pads, g/s. Blood does not arrive only when someone
+# presses a button, and a total frozen between presses reads as a dead display.
+# 0.12 g/s is about 7 mL/min - visibly climbing without running away.
+WEIGHT_DEMO_DRIFT_G_PER_S = _env_float("HEMOGUARD_WEIGHT_DEMO_DRIFT", 0.12)
 
 # Optional second node: the ESP8266 carrying the MAX30102 pulse oximeter. It is
 # a separate board on its own IP, so it gets its own poller and its readings are
@@ -308,7 +338,8 @@ PASSTHROUGH_FIELDS = (
     "norm_r", "norm_g", "norm_b", "hex",
     "calibrated", "absorbance", "concentration",
     "cal_red", "cal_green", "cal_ir",
-    "pad_count", "last_pad_g", "dry_pad_g", "scale_ready",
+    "pad_count", "last_pad_g", "dry_pad_g", "scale_ready", "weight_simulated",
+    "live_gross_g", "live_net_g",
     "finger", "vitals_ir", "vitals_simulated",
     "abs_red", "abs_green", "abs_ir",
     "conc_red", "conc_green", "conc_ir",
@@ -806,6 +837,13 @@ consecutive_invalid = 0    # runs of readings the node flagged valid:false
 latest_vitals = None
 latest_vitals_at = None
 
+# Demo weighing state, used only when WEIGHT_DEMO is on.
+demo_total_g = 0.0
+demo_last_pad_g = 0.0
+demo_pad_count = 0
+demo_dry_pad_g = 17.0
+demo_drift_since = None   # when the current seepage interval started
+
 # When the COLOUR node last produced a reading, kept apart from
 # last_reading_time (which covers any broadcast, from either board). Without the
 # distinction, a vitals-only frame would refresh the same clock it is tested
@@ -895,6 +933,7 @@ async def handle_reading(reading):
 
     moment = datetime.now()
     reading = merge_vitals(reading)
+    reading = apply_weight_demo(reading)
     reading = dict(reading)
     reading["timestamp"] = moment.isoformat(timespec="milliseconds")
 
@@ -940,6 +979,42 @@ def merge_vitals(reading):
     return reading
 
 
+def demo_drift_g():
+    """Blood accrued since the last pad was banked.
+
+    Time-based rather than accumulated per tick, so the climb is the same
+    whatever the publish cadence happens to be. The rate itself breathes on a
+    slow sine so the line is not a dead straight ramp - but it never decreases,
+    because blood already lost does not come back.
+    """
+    if demo_pad_count <= 0 or demo_drift_since is None:
+        return 0.0
+    elapsed = (datetime.now() - demo_drift_since).total_seconds()
+    if elapsed <= 0:
+        return 0.0
+    breathing = 1.0 + 0.35 * math.sin(elapsed / 7.0)
+    return WEIGHT_DEMO_DRIFT_G_PER_S * elapsed * breathing
+
+
+def apply_weight_demo(reading):
+    """Overlay demo pad figures, flagged so the dashboard can label them."""
+    if not WEIGHT_DEMO:
+        return reading
+    reading = dict(reading)
+    # Demo starts at a literal 0.0, not null. In demo the tray is understood to
+    # be empty rather than unmeasured, so zero is the honest figure - and it
+    # gives the operator something to watch climb as pads are added.
+    reading["weight"] = round(demo_total_g + demo_drift_g(), 2)
+    reading["pad_count"] = demo_pad_count
+    reading["last_pad_g"] = demo_last_pad_g
+    reading["dry_pad_g"] = demo_dry_pad_g
+    reading["scale_ready"] = True
+    reading["live_gross_g"] = round(demo_dry_pad_g + demo_drift_g(), 2)
+    reading["live_net_g"] = round(demo_drift_g(), 2)
+    reading["weight_simulated"] = True
+    return reading
+
+
 async def publish_vitals_only():
     """Broadcast a frame built from the oximeter alone.
 
@@ -950,7 +1025,7 @@ async def publish_vitals_only():
     global latest_payload, last_reading_time, currently_stale
 
     moment = datetime.now()
-    reading = merge_vitals({"weight": None, "valid": True})
+    reading = apply_weight_demo(merge_vitals({"weight": None, "valid": True}))
     reading["timestamp"] = moment.isoformat(timespec="milliseconds")
 
     payload = build_payload(reading, moment)
@@ -1037,6 +1112,41 @@ async def poll_vitals():
                 except Exception as exc:
                     print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
                           f"ERROR publishing vitals-only frame: {exc}")
+
+
+async def demo_publisher():
+    """Publish frames when demo weighing is on and no node is feeding.
+
+    Without a colour or vitals node there is nothing generating frames at all,
+    so the demo totals would never reach the dashboard. This fills that gap only
+    - the moment real hardware starts feeding, its frames take over and this
+    stands down.
+    """
+    if not WEIGHT_DEMO:
+        return
+
+    print("WEIGHT DEMO is ON - pad weights are generated, not measured.")
+
+    while True:
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+        quiet = (
+            last_colour_at is None
+            or (datetime.now() - last_colour_at).total_seconds() > COLOUR_QUIET_SECONDS
+        )
+        vitals_quiet = (
+            latest_vitals_at is None
+            or (datetime.now() - latest_vitals_at).total_seconds()
+            > VITALS_MAX_AGE_SECONDS
+        )
+        if not (quiet and vitals_quiet):
+            continue
+
+        try:
+            await publish_vitals_only()
+        except Exception as exc:
+            print(f"[{datetime.now().isoformat(timespec='milliseconds')}] "
+                  f"ERROR publishing demo frame: {exc}")
 
 
 async def poll_sensor():
@@ -1146,6 +1256,7 @@ async def lifespan(app):
 
     poller = asyncio.create_task(poll_sensor())
     vitals = asyncio.create_task(poll_vitals())
+    demo = asyncio.create_task(demo_publisher())
     monitor = asyncio.create_task(staleness_monitor())
 
     print(f"Logging to {LOG_FILE}")
@@ -1163,6 +1274,7 @@ async def lifespan(app):
 
     poller.cancel()
     vitals.cancel()
+    demo.cancel()
     monitor.cancel()
 
 
@@ -1403,6 +1515,29 @@ async def _node_get(url, timeout, params=None):
 @app.post("/weigh")
 async def weigh():
     """Weigh the pad currently on the tray and add its blood to the total."""
+    global demo_total_g, demo_last_pad_g, demo_pad_count
+
+    if WEIGHT_DEMO:
+        global demo_drift_since
+        gross = random.uniform(WEIGHT_DEMO_MIN_G, WEIGHT_DEMO_MAX_G)
+        blood = max(0.0, gross - demo_dry_pad_g)
+        # Bank the seepage accrued since the last pad before adding this one,
+        # so the running total never jumps backwards when the clock resets.
+        demo_total_g = round(demo_total_g + demo_drift_g() + blood, 2)
+        demo_last_pad_g = round(blood, 2)
+        demo_pad_count += 1
+        demo_drift_since = datetime.now()
+        result = {"status": "ok", "gross_g": round(gross, 2),
+                  "pad_g": demo_last_pad_g, "total_g": demo_total_g,
+                  "pad_count": demo_pad_count, "dry_pad_g": demo_dry_pad_g,
+                  "simulated": True}
+        await manager.broadcast({
+            "type": "weigh", "status": "complete",
+            "message": (f"SIMULATED pad {demo_pad_count}: {demo_last_pad_g:.2f} g "
+                        f"· total {demo_total_g:.2f} g"),
+            "result": result})
+        return result
+
     if not WEIGH_URL:
         return {"status": "error",
                 "message": "HEMOGUARD_ESP32_IP is not set - no load cell to read."}
@@ -1443,6 +1578,13 @@ async def set_dry_pad(body: dict):
         return {"status": "error",
                 "message": "Dry pad weight must be between 0 and 500 g."}
 
+    if WEIGHT_DEMO:
+        global demo_dry_pad_g
+        demo_dry_pad_g = grams
+        await manager.broadcast({"type": "weigh", "status": "complete",
+                                 "message": f"Dry pad weight set to {grams:g} g"})
+        return {"status": "ok", "dry_pad_g": grams, "simulated": True}
+
     if not DRY_PAD_URL:
         return {"status": "error",
                 "message": "HEMOGUARD_ESP32_IP is not set - no load cell."}
@@ -1462,6 +1604,16 @@ async def set_dry_pad(body: dict):
 @app.post("/weight_reset")
 async def weight_reset():
     """Clear the accumulated blood total, e.g. between patients."""
+    if WEIGHT_DEMO:
+        global demo_total_g, demo_last_pad_g, demo_pad_count, demo_drift_since
+        demo_total_g = 0.0
+        demo_last_pad_g = 0.0
+        demo_pad_count = 0
+        demo_drift_since = None
+        await manager.broadcast({"type": "weigh", "status": "complete",
+                                 "message": "Blood total reset to 0 g"})
+        return {"status": "ok", "total_g": 0.0, "pad_count": 0}
+
     if not WEIGHT_RESET_URL:
         return {"status": "error",
                 "message": "HEMOGUARD_ESP32_IP is not set - no load cell."}
@@ -1496,6 +1648,24 @@ async def weight_calibrate():
         "result": result,
     })
     return result
+
+
+@app.get("/scale")
+async def scale_reading():
+    """Live gross and net from the load cell, without touching the total.
+
+    This is the check for "the scale reads wrong": getWeight() returns NET, so a
+    100 g object on a bare tray shows 83 g with a 17 g pad offset. Gross is what
+    proves the calibration itself.
+    """
+    if not SCALE_URL:
+        return {"status": "error",
+                "message": "HEMOGUARD_ESP32_IP is not set - no load cell."}
+    try:
+        return await _node_get(SCALE_URL, WEIGH_TIMEOUT_SECONDS)
+    except Exception as exc:
+        return {"status": "error",
+                "message": describe_node_failure(exc, SCALE_URL)}
 
 
 @app.get("/diag")

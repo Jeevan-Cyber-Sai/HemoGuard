@@ -125,6 +125,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._dry_pad()
         if self.path == "/weight_reset":
             return self._weight_reset()
+        if self.path == "/scale":
+            return self._scale()
+        if self.path == "/weight_calibrate":
+            self._json(200, {"status": "started"}); return
         self.send_response(404)
         self.end_headers()
 
@@ -232,12 +236,19 @@ class Handler(BaseHTTPRequestHandler):
             gross = [42.0, 61.5, 28.0, 74.2, 35.8][(_pad_seq - 1) % 5]
             blood = max(0.0, gross - _dry_pad_g)
             _last_pad_g = round(blood, 2)
+            self._gross = gross
             _total_g = round(_total_g + blood, 2)
             _pad_count += 1
             print(f"  pad {_pad_count}: {_last_pad_g} g blood, total {_total_g} g")
-            self._json(200, {"status": "ok", "pad_g": _last_pad_g,
+            self._json(200, {"status": "ok", "gross_g": gross, "pad_g": _last_pad_g,
                              "total_g": _total_g, "pad_count": _pad_count,
                              "dry_pad_g": _dry_pad_g})
+
+    def _scale(self):
+        gross = [42.0, 61.5, 28.0, 74.2, 35.8][_pad_seq % 5]
+        net = max(0.0, gross - _dry_pad_g)
+        self._json(200, {"status": "ok", "gross_g": gross, "net_g": round(net, 2),
+                         "dry_pad_g": _dry_pad_g, "factor": 428.5})
 
     def _dry_pad(self):
         global _dry_pad_g

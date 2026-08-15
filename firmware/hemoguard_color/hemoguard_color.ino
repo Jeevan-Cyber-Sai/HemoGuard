@@ -93,6 +93,20 @@ float lastPadWeight = 0.0;
 uint16_t padCount = 0;
 unsigned long lastPadMs = 0;
 
+// LIVE reading - whatever is on the tray right now, updated continuously.
+//
+// get_units(10) blocks about a second waiting for ten conversions, which is why
+// it cannot live in loop(). But is_ready() is just a pin read, and read() only
+// blocks when data is NOT ready - so polling is_ready() first and reading only
+// when it says yes costs about a millisecond and never stalls the LED cycle.
+//
+// The HX711 delivers 10 samples a second; a light EMA over those is enough to
+// hold the display steady without adding lag anyone would notice.
+float liveGrossG = 0.0f;
+bool liveWeightValid = false;
+
+static const float LIVE_WEIGHT_SMOOTHING = 0.25f;
+
 uint16_t rawR = 0;
 uint16_t rawG = 0;
 uint16_t rawB = 0;
@@ -456,6 +470,43 @@ float getWeight()
 }
 
 // =====================================================
+// LIVE SCALE POLL  (non-blocking)
+// =====================================================
+
+void pollScale()
+{
+  if (!haveScale || !calibrationComplete) return;
+
+  // Instant pin check. Without this guard, read() would wait on the chip and
+  // drag the whole loop down to the HX711's 10 Hz.
+  if (!scale.is_ready()) return;
+
+  long raw = scale.read();
+
+  float factor = scale.get_scale();
+  if (!(factor != 0.0f)) return;
+
+  float grams = ((float)raw - (float)scale.get_offset()) / factor;
+
+  if (!liveWeightValid)
+  {
+    liveGrossG = grams;
+    liveWeightValid = true;
+  }
+  else
+  {
+    liveGrossG += LIVE_WEIGHT_SMOOTHING * (grams - liveGrossG);
+  }
+}
+
+// Net of the dry pad, floored - the same convention getWeight() uses.
+float liveNetG()
+{
+  float net = liveGrossG - DRY_PAD_WEIGHT;
+  return (net < 0.5f) ? 0.0f : net;
+}
+
+// =====================================================
 // PAD WEIGHING
 // =====================================================
 // One press, one pad. The blood weight of each pad is added to a running total,
@@ -748,15 +799,32 @@ void capturePhaseSnapshot(bool ok)
 
 void buildSnapshotJSON(char *out, size_t len)
 {
+  // null, not 0.00, until a pad has actually been weighed. A literal zero is a
+  // measurement - "the pad held no blood" - and the dashboard rightly displays
+  // it as one. Before the first weighing there is no measurement at all, and
+  // saying so is the difference between an empty reading and a wrong one.
+  char weightField[16];
+
+  if (padCount > 0)
+  {
+    snprintf(weightField, sizeof(weightField), "%.2f", (double)totalBloodWeight);
+  }
+  else
+  {
+    snprintf(weightField, sizeof(weightField), "null");
+  }
+
   snprintf(
     out,
     len,
     "{\"uptime_ms\":%lu"
-    ",\"weight\":%.2f"
+    ",\"weight\":%s"
     ",\"pad_count\":%u"
     ",\"last_pad_g\":%.2f"
     ",\"dry_pad_g\":%.2f"
     ",\"scale_ready\":%s"
+    ",\"live_gross_g\":%.2f"
+    ",\"live_net_g\":%.2f"
     ",\"spo2\":null"
     ",\"pulse\":null"
     ",\"red\":%u"
@@ -782,11 +850,13 @@ void buildSnapshotJSON(char *out, size_t len)
     ",\"cal_green\":%s"
     ",\"cal_ir\":%s}",
     snapUptime,
-    (double)totalBloodWeight,
+    weightField,
     padCount,
     (double)lastPadWeight,
     (double)DRY_PAD_WEIGHT,
     (haveScale && calibrationComplete) ? "true" : "false",
+    (double)liveGrossG,
+    (double)liveNetG(),
     snapRawR,
     snapRawG,
     snapRawB,
@@ -862,7 +932,7 @@ void buildPhaseBaselineJSON(char *out, size_t len, uint8_t phase)
 
 void printSerialJSON()
 {
-  char json[768];
+  char json[896];
 
   buildSnapshotJSON(json, sizeof(json));
 
@@ -871,7 +941,7 @@ void printSerialJSON()
 
 void handleSensor()
 {
-  char json[768];
+  char json[896];
 
   buildSnapshotJSON(json, sizeof(json));
 
@@ -913,18 +983,22 @@ void handleWeigh()
     return;
   }
 
+  float gross = scale.get_units(10);
+
   float pad = weighPad();
 
-  char json[260];
+  char json[300];
 
   snprintf(
     json,
     sizeof(json),
     "{\"status\":\"ok\""
+    ",\"gross_g\":%.2f"
     ",\"pad_g\":%.2f"
     ",\"total_g\":%.2f"
     ",\"pad_count\":%u"
     ",\"dry_pad_g\":%.2f}",
+    (double)gross,
     (double)pad,
     (double)totalBloodWeight,
     padCount,
@@ -1009,6 +1083,51 @@ void handleWeightCalibrate()
               "\"message\":\"Scale calibration started - follow the serial prompts\"}");
 
   calibrateLoadCell();
+}
+
+// =====================================================
+// LIVE SCALE READING  ->  GET /scale
+// =====================================================
+// Gross AND net, so the scale can be checked against a known object without
+// touching the running total. getWeight() only ever returns net - gross minus
+// the dry pad - so a 100 g weight on a bare tray reads 83 g and looks broken
+// when the scale is in fact perfect. Seeing both numbers settles that in one
+// glance.
+
+void handleScale()
+{
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+
+  if (!haveScale || !calibrationComplete)
+  {
+    server.send(503, "application/json",
+                "{\"status\":\"error\","
+                "\"message\":\"Load cell not calibrated\"}");
+    return;
+  }
+
+  float gross = scale.get_units(10);
+  float net = gross - DRY_PAD_WEIGHT;
+
+  if (net < 0.5f) net = 0.0f;
+
+  char json[240];
+
+  snprintf(
+    json,
+    sizeof(json),
+    "{\"status\":\"ok\""
+    ",\"gross_g\":%.2f"
+    ",\"net_g\":%.2f"
+    ",\"dry_pad_g\":%.2f"
+    ",\"factor\":%.4f}",
+    (double)gross,
+    (double)net,
+    (double)DRY_PAD_WEIGHT,
+    (double)calibrationFactor
+  );
+
+  server.send(200, "application/json", json);
 }
 
 void handleWeightReset()
@@ -1527,6 +1646,11 @@ void setup()
     handleWeightCalibrate
   );
 
+  server.on(
+    "/scale",
+    handleScale
+  );
+
   server.begin();
 
   Serial.println();
@@ -1564,17 +1688,27 @@ void setup()
   else
   {
     Serial.println("HX711 detected!");
-    Serial.println();
-    Serial.println("Load cell NOT calibrated yet. Press CALIBRATE SCALE on the");
-    Serial.println("dashboard (or GET /weight_calibrate) when the tray is ready.");
-  }
 
-  // setup() ends here so loop() can start. The LED phase cycle, the colour
-  // readings and /sensor all live in loop(), so anything that blocks setup
-  // blocks ALL of them - which is exactly what running the load-cell
-  // calibration here did. scale.tare() waits on the chip with no timeout of
-  // its own, so one hesitant HX711 left the LEDs dark and the node silent.
-  // Calibration is now operator-triggered, after the board is already alive.
+    // Calibrated at boot, exactly as the original weight sketch did: tare on
+    // the empty tray, then ten seconds against the known weight. Nothing else
+    // can produce a correct reading, because get_units() needs both the offset
+    // and the scale factor this routine establishes - without them every
+    // weighing is a raw ADC count, not grams.
+    //
+    // The one addition is a readiness check before it starts. scale.tare()
+    // waits on the chip with no timeout of its own, so a hesitant HX711 could
+    // hang setup() - and since the LED cycle and colour readings both live in
+    // loop(), that took the whole node down with it.
+    if (scale.wait_ready_timeout(2000))
+    {
+      calibrateLoadCell();
+    }
+    else
+    {
+      haveScale = false;
+      Serial.println("HX711 stopped responding before calibration - skipped.");
+    }
+  }
 
   Serial.println();
   Serial.println("Open the IP address above");
@@ -1690,6 +1824,8 @@ void loop()
   server.handleClient();
 
   maintainWifi();
+
+  pollScale();
 
   if (calibrating)
   {
